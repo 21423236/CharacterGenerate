@@ -66,7 +66,7 @@ class StudioRun {
         await fs.writeFile(path.join(history, this.record.runId + '.json'), JSON.stringify(this.record, null, 2))
       }
       await this.save({ version: 1, projectId: this.projectId, runId: randomUUID(), config, files, assetIds, expectedModelId,
-        submitted: false, taskId: null, remoteProjectId: null, recoveryMode: null, selectedModelURL: null, recoveredAt: null, appliedConfig: null, status: 'running', stage: 'preparing', message: '正在打开智能网格工作台', started: new Date().toISOString() })
+        submitted: false, taskId: null, remoteProjectId: null, splitSubmitted: false, splitTaskId: null, splitProjectId: null, recoveryMode: null, selectedModelURL: null, recoveredAt: null, appliedConfig: null, status: 'running', stage: 'preparing', message: '正在打开智能网格工作台', started: new Date().toISOString() })
       this.launch()
     } catch (error) { this.active = false; throw error }
   }
@@ -131,12 +131,14 @@ class StudioRun {
 
   async execute(signal) {
     if (this.record.submitted && this.record.recoveryMode === 'selected-model') {
+      if (this.record.config.splitModel && !this.record.splitSubmitted) { await this.executeSplit(signal); return }
       await this.stage('exporting', '正在导出你选中的网页模型，完成后直接显示结果')
       await this.driver.exportSelectedModel(this.record, signal)
       await this.onDownload(signal)
       if (this.record.status !== 'complete') throw new PauseRequired('下载尚未完成，点击继续任务可再次导出这个模型')
       return
     }
+    if (this.record.splitSubmitted) { await this.executeSplit(signal); return }
     if (!this.record.submitted) {
       await this.stage('preparing', '检查登录状态并准备网页')
       await this.driver.reset(signal)
@@ -165,10 +167,44 @@ class StudioRun {
     await this.stage('waiting', '已记录本次任务，等待 Tripo 生成完成')
     const result = await this.driver.waitForResult(this.record, signal)
     if (result.failed) { await this.save({ status: 'failed', stage: 'failed', message: 'Tripo 网页报告本次生成失败，可检查网页后重新开始' }); return }
+    if (this.record.config.splitModel) { await this.executeSplit(signal); return }
     await this.stage('exporting', '生成完成，正在导出本次任务的 GLB')
     await this.driver.exportModel(this.record, result, signal)
     await this.onDownload(signal)
     if (this.record.status !== 'complete') throw new PauseRequired('下载或回填尚未完成，请检查工具栏提示后继续')
+  }
+
+  async executeSplit(signal) {
+    if (!this.record.splitSubmitted) {
+      await this.stage('split-configuring', '模型已生成，正在选择智能拆分第二档：6–15 个部件')
+      await this.driver.prepareSegmentation(this.record, signal)
+      await this.driver.startTracking({ ...this.record, operation: 'segmentation', taskId: null }, event => this.splitEvent(event))
+      if (signal.aborted) throw new PauseRequired('二次拆分已暂停')
+      await this.stage('split-submitting', '正在提交二次拆分，请勿重复操作', { splitSubmitted: true, recoveryMode: null, splitSubmittedAt: new Date().toISOString() })
+      await this.driver.submitSegmentation(signal)
+      await this.driver.waitForTask(signal)
+    } else {
+      if (!this.record.splitTaskId) throw new PauseRequired('二次拆分已发出，但未记录编号。请在网页选中拆分结果，再点击“接续当前网页模型”，不会重复拆分')
+      await this.driver.startTracking(this.splitRecord(), event => this.splitEvent(event))
+      await this.driver.restore(this.splitRecord(), signal)
+    }
+    await this.stage('split-waiting', '等待 Tripo 二次拆分完成 · 第二档 6–15 个部件')
+    const record = this.splitRecord()
+    const result = await this.driver.waitForResult(record, signal)
+    if (result.failed) throw new PauseRequired('Tripo 报告二次拆分失败，请在网页核对；原生成任务不会重提')
+    await this.stage('exporting', '二次拆分完成，正在导出保留独立部件的 GLB')
+    await this.driver.exportModel(record, result, signal)
+    await this.onDownload(signal)
+    if (this.record.status !== 'complete') throw new PauseRequired('拆分模型尚未导入，请继续下载')
+  }
+
+  splitRecord() {
+    return { ...this.record, operation: 'segmentation', taskId: this.record.splitTaskId, remoteProjectId: this.record.splitProjectId || this.record.remoteProjectId }
+  }
+
+  async splitEvent(event) {
+    if (!event.taskId || (this.record.splitTaskId && this.record.splitTaskId !== event.taskId)) return
+    await this.save({ splitTaskId: event.taskId, splitProjectId: event.remoteProjectId || this.record.remoteProjectId })
   }
 
   async taskEvent(event) {

@@ -116,13 +116,14 @@ class StudioDriver {
     this.events = Promise.resolve(); this.detailEpoch = 0
     this.submissionRequest = null
     const requests = new Map()
+    const operation = record.operation === 'segmentation' ? protocol.SEGMENT : protocol.GENERATE
     this.listener = (_event, method, params) => {
       if (method === 'Network.requestWillBeSent') {
         const route = protocol.apiPath(params.request.url)
-        if (!route || !(route === protocol.GENERATE || route === protocol.PROGRESS || route.startsWith(protocol.DETAIL))) return
+        if (!route || !(route === operation || route === protocol.PROGRESS || route.startsWith(protocol.DETAIL))) return
         // Observe the response even when Studio changes its model version,
         // normalizes values, or represents views/variations differently.
-        const generation = route === protocol.GENERATE && params.request.method === 'POST' && this.acceptSubmission && !this.identity && !this.submissionRequest
+        const generation = route === operation && params.request.method === 'POST' && this.acceptSubmission && !this.identity && !this.submissionRequest
         if (generation) this.submissionRequest = params.requestId
         if (requests.size > 200) requests.delete(requests.keys().next().value)
         requests.set(params.requestId, { route, generation, epoch: this.detailEpoch })
@@ -227,6 +228,21 @@ class StudioDriver {
     if (signal.aborted) throw new PauseRequired('已暂停；请核对网页是否已经生成')
     this.acceptSubmission = true
     await this.invoke('generate')
+  }
+
+  async prepareSegmentation(record, signal) {
+    this.stopTracking()
+    if (protocol.routeProject(this.contents.getURL()) !== record.remoteProjectId) await this.loadProject(record.remoteProjectId, signal, 30000, record.selectedModelURL)
+    if (!new URL(this.contents.getURL()).pathname.startsWith('/workspace/segmentation/')) await this.invoke('open-segmentation', { projectId: record.remoteProjectId })
+    await this.until(async () => ({ ...await this.invoke('snapshot'), ready: await this.invoke('segmentation-ready') }), value => value.ready, '智能拆分选项尚未就绪，请在网页检查选中的模型', signal, 60000)
+    if (protocol.routeProject(this.contents.getURL()) !== record.remoteProjectId) throw new PauseRequired('拆分页面没有选中本次模型')
+    await this.invoke('segmentation-medium')
+  }
+
+  async submitSegmentation(signal) {
+    if (signal.aborted) throw new PauseRequired('拆分已暂停，请核对网页任务')
+    this.acceptSubmission = true
+    await this.invoke('segmentation-submit')
   }
 
   async waitForTask(signal) {

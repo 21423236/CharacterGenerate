@@ -43,7 +43,7 @@ function studioPage(action, args = {}) {
       return true
     }
     case 'snapshot': return {
-      ready: all('button').some(el => text(el) === '智能网格'), loginRequired: loginRequired(),
+      ready: all('button').some(el => text(el) === '智能网格') || all('[data-workspace-panel] h2').some(el => text(el) === '智能拆分'), loginRequired: loginRequired(),
       notices: all('[data-sonner-toast],[role="alert"]').map(el => text(el).slice(0,300)),
       slots: Object.fromEntries(Object.keys(slotNames).map(label => [label, slotState(label)])),
     }
@@ -110,6 +110,17 @@ function studioPage(action, args = {}) {
       click(target)
       return true
     }
+    case 'open-segmentation': {
+      const link = one(all('a[href]').filter(el => /^\/workspace\/segmentation\//.test(new URL(el.href).pathname) && text(el) === '智能拆分'), '智能拆分入口')
+      if (!new URL(link.href).pathname.endsWith(args.projectId)) throw new Error('拆分入口没有关联当前模型')
+      click(link); return true
+    }
+    case 'segmentation-ready': return all('[data-workspace-panel] button').some(el => /6\s*[-–—~～]\s*15\s*个部件/.test(text(el)))
+    case 'segmentation-medium': {
+      click(one(all('[data-workspace-panel] button').filter(el => /6\s*[-–—~～]\s*15\s*个部件/.test(text(el))), '第二档 6–15 个部件'))
+      return true
+    }
+    case 'segmentation-submit': click(one(all('[data-workspace-panel] button').filter(el => /^开始拆分(?:\s|$)/.test(text(el))), '开始拆分按钮')); return true
     case 'export-visible': return all('[aria-haspopup="dialog"]').some(el => text(el) === '导出')
     case 'export-ready': {
       const targets = all('[aria-haspopup="dialog"]').filter(el => text(el) === '导出')

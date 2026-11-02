@@ -100,6 +100,8 @@ async function refreshInputs(ctx) {
 
 function showStudio(ctx, presentation = 'workspace') {
   if (ctx.window.isDestroyed()) return
+  ctx.presented = true
+  ctx.window.setFocusable(true)
   ctx.presentation = presentation
   ctx.window.setTitle(presentation === 'login' ? '登录 Tripo · 登录后自动继续' : `Tripo · ${ctx.title}`)
   state(ctx)
@@ -107,8 +109,18 @@ function showStudio(ctx, presentation = 'workspace') {
 }
 
 function hideStudio(ctx) {
-  if (!ctx.window.isDestroyed()) ctx.window.hide()
-  for (const popup of ctx.popups) if (!popup.isDestroyed()) popup.hide()
+  ctx.presented = false
+  for (const popup of ctx.popups) if (!popup.isDestroyed()) { popup.setFocusable(false); popup.hide() }
+  if (!ctx.window.isDestroyed()) { ctx.window.setFocusable(false); ctx.window.hide() }
+}
+
+function returnToMain(ctx) {
+  hideStudio(ctx)
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+  mainWindow.webContents.focus()
 }
 
 function bindRemote(contents, ctx) {
@@ -123,14 +135,26 @@ function bindRemote(contents, ctx) {
   contents.setWindowOpenHandler(({ url }) => {
     if (!remoteURL(url) && url !== 'about:blank') return { action: 'deny' }
     return { action: 'allow', overrideBrowserWindowOptions: {
+      show: false, focusable: false, modal: false, backgroundColor: '#191c1c',
       width: 1050, height: 800, autoHideMenuBar: true,
-      webPreferences: { session: studioSession, nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true },
+      webPreferences: { session: studioSession, nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, disableDialogs: true },
     } }
   })
   contents.on('did-create-window', popup => {
     ctx.popups.add(popup)
     popup.once('closed', () => ctx.popups.delete(popup))
     bindRemote(popup.webContents, ctx)
+    // Exports can open about:blank first, then navigate or focus it after the
+    // download has completed. Such a popup must never cover the result window.
+    const syncPopup = () => {
+      if (popup.isDestroyed()) return
+      const url = popup.webContents.getURL()
+      if (ctx.presented && url && url !== 'about:blank') { popup.setFocusable(true); popup.show() }
+      else { popup.setFocusable(false); popup.hide() }
+    }
+    popup.webContents.on('did-finish-load', syncPopup)
+    popup.on('show', () => { if (!ctx.presented || popup.webContents.getURL() === 'about:blank') { popup.setFocusable(false); popup.hide() } })
+    syncPopup()
   })
 }
 
@@ -181,8 +205,7 @@ function setupDownloads() {
           const model = await modelFromDownload(destination)
           await queueImport(ctx, model)
           await ctx.automation.downloaded()
-          if (ctx.autoMode) hideStudio(ctx)
-          mainWindow.show(); mainWindow.focus()
+          returnToMain(ctx)
           return
         }
         if (path.extname(name).toLowerCase() !== '.glb') {
@@ -229,12 +252,12 @@ async function openStudio(id) {
   await prepareViews(project, views)
   await fsp.mkdir(downloads, { recursive: true })
   const window = new BrowserWindow({
-    show: false, parent: mainWindow,
+     show: false, focusable: false,
     width: 1440, height: 1000, minWidth: 1100, minHeight: 700, autoHideMenuBar: true,
     title: `Tripo · ${project.title}`, backgroundColor: '#191c1c',
     webPreferences: { preload: path.join(__dirname, 'toolbar-preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false },
   })
-  const view = new WebContentsView({ webPreferences: { session: studioSession, nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: false } })
+  const view = new WebContentsView({ webPreferences: { session: studioSession, nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: false, disableDialogs: true } })
   const ctx = { id, title: project.title, window, view, views, downloads, modelID: project.model?.id || '', pending: 0, importQueue: Promise.resolve(), popups: new Set(), message: Object.keys(project.views || {}).length ? '首次请在下方网页登录。点击「打开三视图文件夹」取图；生成完成后在网页导出 GLB，下载将自动回填此角色。' : '请先登录。此项目尚未裁切三视图；可在网页下载已有模型，或裁切后关闭并重新打开工作台。' }
   ctx.inputs = inputState(project)
   ctx.message = ctx.inputs.ready ? '三视图已准备好。点击“一键上传并生成”将在后台处理，需要登录时会弹窗。' : ctx.inputs.reason
@@ -343,7 +366,7 @@ async function automate(id, action) {
   await prepareViews(project, views)
   ctx.views = views
   ctx.modelID = project.model?.id || ''
-  await ctx.automation.start({ config: { topology: settings.tripo.studio_topology || 'triangle', faces: settings.tripo.studio_face_limit ?? 15000 },
+  await ctx.automation.start({ config: { topology: project.split_model ? 'triangle' : settings.tripo.studio_topology || 'triangle', faces: settings.tripo.studio_face_limit ?? 15000, splitModel: !!project.split_model },
     files: Object.fromEntries(labels.map(label => [label, path.join(views, `${label}.png`)])),
     assetIds: Object.fromEntries(labels.map(label => [label, project.views[label].id])), expectedModelId: ctx.modelID })
 }
@@ -353,12 +376,15 @@ ipcMain.handle('forge:delete-project', async (event, id) => {
   projectID(id)
   if (deletingProjects.has(id) || opening.has(id)) throw new Error('工作台正在操作，请稍后再删除')
   deletingProjects.add(id)
+  let related = []
   try {
-    const ctx = studios.get(id)
-    if (ctx?.automation.active || ctx?.pending) throw new Error('角色正在生成、下载或导入，请暂停任务或等待完成后再删除')
-    if (ctx) ctx.window.destroy()
+    related = (await api(`/projects/${id}/parts`)).map(p => p.id)
+    for (const child of related) deletingProjects.add(child)
+    const contexts = [id, ...related].map(key => studios.get(key)).filter(Boolean)
+    if (related.some(key => opening.has(key)) || contexts.some(ctx => ctx.automation.active || ctx.pending)) throw new Error('角色或部件正在生成、下载或导入，请暂停任务或等待完成后再删除')
+    for (const ctx of contexts) ctx.window.destroy()
     await api(`/projects/${id}`, { method: 'DELETE' })
-  } finally { deletingProjects.delete(id) }
+  } finally { for (const key of [id, ...related]) deletingProjects.delete(key) }
 })
 
 ipcMain.handle('forge:studio', async (event, id) => {
@@ -416,7 +442,7 @@ ipcMain.handle('studio:action', async (event, action) => {
       if (ctx.automation.active) throw new Error('请先暂停自动操作再刷新')
       ctx.view.webContents.loadURL(STUDIO).catch(error => state(ctx, error.message)); break
     case 'external': await shell.openExternal(STUDIO); state(ctx, '已用系统浏览器打开。外部浏览器的下载请用「导入已下载 GLB」选择；登录状态不与内置浏览器共享。'); break
-    case 'return': hideStudio(ctx); mainWindow.show(); mainWindow.focus(); break
+    case 'return': returnToMain(ctx); break
     case 'import': {
       if (ctx.automation.active) throw new Error('请先暂停自动任务，再手动导入模型')
       const result = await dialog.showOpenDialog(ctx.window, { title: `导入 GLB 到「${ctx.title}」`, defaultPath: ctx.downloads, filters: [{ name: 'GLB 模型', extensions: ['glb'] }], properties: ['openFile'] })

@@ -11,6 +11,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(store, "DB", tmp_path / "tasks.sqlite3")
     monkeypatch.setattr(jobs, "DATA", tmp_path)
+    monkeypatch.setitem(config.DEFAULTS, "output_dir", str(tmp_path / "outputs"))
     for section in ("LLM", "IMAGE", "TRIPO"):
         monkeypatch.delenv(f"CHARACTER_FORGE_{section}_KEY", raising=False)
     store.init()

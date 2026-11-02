@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import jobs, processes, store
+from . import jobs, processes, store, parts
 from .config import ROOT, PORT, load_settings, redact, save_settings
 from .images import MAX_IMAGE_BYTES, decode_image, split_views, suggest_boxes
 from .providers import endpoint
@@ -121,6 +121,10 @@ class ProjectUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=100)
     prompt: str | None = Field(default=None, max_length=18000)
     side: Literal["left", "right"] | None = None
+    split_model: bool | None = None
+    binding_mode: Literal["surface", "rigid"] | None = None
+    binding_bone: str | None = Field(default=None, max_length=200)
+    part_edit_prompt: str | None = Field(default=None, max_length=8000)
 
 
 class Transform(BaseModel):
@@ -134,7 +138,7 @@ class Transform(BaseModel):
 
 
 class JobRequest(BaseModel):
-    kind: Literal["chat", "image", "inspect", "model", "resume", "align", "bind", "doctor"]
+    kind: Literal["chat", "image", "part_image", "part_edit", "parts_plan", "assemble", "inspect", "model", "resume", "align", "bind", "doctor"]
     message: str = Field(default="", max_length=8000)
     transform: Transform = Field(default_factory=Transform)
     remote_id: str = Field(default="", max_length=100)
@@ -193,7 +197,40 @@ def project_get(project_id: str):
     return store.get_project(project_id)
 
 
+class PartCreate(BaseModel):
+    title: str = Field(default="", max_length=100)
+    kind: Literal["body", "hair", "top", "coat", "bottom", "shoes", "gloves", "accessory"]
+
+
+@app.get("/api/projects/{project_id}/parts")
+def parts_get(project_id: str):
+    store.get_project(project_id)
+    return parts.children(project_id)
+
+
+@app.post("/api/projects/{project_id}/parts")
+def parts_create(project_id: str, body: PartCreate):
+    ensure_idle(project_id)
+    return parts.create(project_id, body.title, body.kind)
+
+
+@app.post("/api/projects/{project_id}/organize")
+async def organize_assets(project_id: str):
+    return await asyncio.to_thread(parts.organize, project_id)
+
+
+@app.post("/api/projects/{project_id}/open-folder")
+async def open_asset_folder(project_id: str):
+    import os
+    result = await asyncio.to_thread(parts.organize, project_id)
+    os.startfile(result["path"])
+    return result
+
+
 def ensure_idle(project_id):
+    project = store.get_project(project_id)
+    if project.get("parent_id"):
+        ensure_idle(project["parent_id"])
     if any(job["status"] in ("queued", "running") for job in store.list_jobs(project_id)):
         raise ValueError("项目正在处理任务，请完成后再修改输入")
 
@@ -215,10 +252,19 @@ async def jobs_create(project_id: str, body: JobRequest):
     project = store.get_project(project_id)
     if body.kind == "model" and load_settings()["tripo"]["mode"] != "api":
         raise ValueError("当前为网页会员模式，请打开 Tripo 工作台生成；API 建模需在设置中显式切换")
-    if body.kind in ("model", "image", "bind") and not body.confirmed:
+    if body.kind in ("model", "image", "part_image", "part_edit", "bind", "assemble") and not body.confirmed:
         raise ValueError("此操作需要用户确认")
     if body.kind == "image" and not project.get("prompt", "").strip():
         raise ValueError("请先填写角色设计提示词")
+    if body.kind == "part_image" and not project.get("parent_id"):
+        raise ValueError("请先创建独立部件")
+    if body.kind == "part_edit":
+        if not project.get("parent_id") or not project.get("part_image"):
+            raise ValueError("请先生成部件图，再填写要求进行修改")
+        if not body.message.strip():
+            raise ValueError("请填写部件修改要求")
+    if body.kind == "image" and project.get("parent_id") and not project.get("part_image"):
+        raise ValueError("请先生成部件独立图片，再生成部件三视图")
     if body.kind == "chat" and not body.message.strip():
         raise ValueError("请输入消息")
     return jobs.launch(project_id, body.kind, body.model_dump(exclude={"kind", "confirmed"}))
@@ -248,6 +294,10 @@ async def upload(project_id: str, kind: Literal["reference", "sheet", "model"], 
         if source == "studio":
             job = store.create_job(project_id, "studio_import")
             store.update_job(job["id"], "success", progress=100, message="Tripo 网页模型已导入", result={"assets": {"model": asset}})
+        try:
+            await asyncio.to_thread(parts.organize, project_id)
+        except OSError as exc:
+            result["folder_warning"] = f"模型已导入，文件夹整理失败：{redact(str(exc))}"
         return result
     image = await asyncio.to_thread(decode_image, raw)
     if kind == "reference" and len(project.get("references", [])) >= 8:

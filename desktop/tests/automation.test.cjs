@@ -157,6 +157,30 @@ test('a pre-submit pause can be cancelled and replaced with a fresh input snapsh
   } finally { await fs.rm(dir, { recursive: true, force: true }) }
 })
 
+test('secondary segmentation checkpoint survives restart without another paid click', async () => {
+  const dir = await directory()
+  let clicks = 0
+  const driver = { prepareSegmentation: async()=>{}, startTracking: async()=>{}, stopTracking:()=>{}, submitSegmentation: async()=>{
+    const saved = JSON.parse(await fs.readFile(path.join(dir,'automation.json'),'utf8'))
+    assert.equal(saved.splitSubmitted,true)
+    assert.equal(saved.recoveryMode,null)
+    clicks++
+    throw new Error('disconnected after segmentation click')
+  } }
+  try {
+    const run=new StudioRun({directory:dir,projectId:'a'.repeat(32),driver})
+    await run.save({version:1,projectId:'a'.repeat(32),config:{...options.config,splitModel:true},submitted:true,
+      taskId:null,remoteProjectId:project,recoveryMode:'selected-model',status:'paused'})
+    await run.resume();await run.work
+    assert.equal(clicks,1)
+    const restored=new StudioRun({directory:dir,projectId:'a'.repeat(32),driver})
+    await restored.load();await restored.resume();await restored.work
+    assert.equal(clicks,1)
+    assert.match(restored.record.message,/二次拆分已发出/)
+    assert.equal(routeProject('https://studio.tripo3d.com/workspace/segmentation/hair-'+project),project)
+  } finally {await fs.rm(dir,{recursive:true,force:true})}
+})
+
 test('archives extract only a unique bounded GLB without using archive paths', async () => {
   const dir = await directory()
   try {

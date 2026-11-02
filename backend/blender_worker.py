@@ -146,9 +146,15 @@ def import_and_align(request, sources):
     low, high = world_bounds(meshes)
     if high.z - low.z < 0.000001:
         raise ValueError("模型高度为零，请调整导入朝向")
-    factor = (source_high.z - source_low.z) / (high.z - low.z) * float(transform.get("scale", 1))
+    # Component models have independent normalized scales. Start from anatomical
+    # height bands, then expose manual scale/offset correction in the preview.
+    bands = {"hair": (.22, .78), "top": (.40, .44), "coat": (.60, .25), "bottom": (.50, .03),
+             "shoes": (.14, 0), "gloves": (.16, .38), "accessory": (.30, .45)}
+    height_ratio, base_ratio = bands.get(request.get("part_kind"), (1, 0))
+    factor = (source_high.z - source_low.z) * height_ratio / (high.z - low.z) * float(transform.get("scale", 1))
     pivot = Vector(((low.x + high.x) / 2, (low.y + high.y) / 2, low.z))
     target = Vector(((source_low.x + source_high.x) / 2, (source_low.y + source_high.y) / 2, source_low.z))
+    target.z += (source_high.z - source_low.z) * base_ratio
     target += Vector(tuple(float(transform.get(f"offset_{a}", 0)) for a in "xyz"))
     for obj in meshes:
         for vertex in obj.data.vertices:
@@ -247,6 +253,25 @@ def silhouette_proxy(sources):
     return objects
 
 
+def bind_component(meshes, sources, arm, config, request):
+    if request.get("binding_mode") != "rigid":
+        return transfer_weights(meshes, sources, arm, int(config.get("influences", 4)))
+    name = request.get("binding_bone", "")
+    if name not in arm.data.bones:
+        raise ValueError(f"刚性绑定骨骼不存在：{name}，请填写模板中的准确骨骼名")
+    report = []
+    for obj in meshes:
+        group = obj.vertex_groups.new(name=name)
+        group.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
+        modifier = obj.modifiers.new("ForgeArmature", 'ARMATURE')
+        modifier.object = arm
+        matrix = obj.matrix_world.copy()
+        obj.parent = arm
+        obj.matrix_world = matrix
+        report.append({"name": obj.name, "vertices": len(obj.data.vertices), "unweighted": 0, "far_from_source": 0})
+    return report
+
+
 def run(request):
     config = request["config"]
     if request["action"] == "inspect":
@@ -263,7 +288,14 @@ def run(request):
         if source.data.shape_keys:
             for key in source.data.shape_keys.key_blocks:
                 key.value = 0
-    meshes = import_and_align(request, sources)
+    meshes, groups = [], []
+    for item in request.get("models", [request]):
+        imported = import_and_align(item, sources)
+        if item.get("title"):
+            for obj in imported:
+                obj.name = item["title"] + "_" + obj.name
+        meshes.extend(imported)
+        groups.append((item, imported))
     export_glb(output / "aligned.glb", meshes)
     proxy = silhouette_proxy(sources)
     export_glb(output / "reference.glb", proxy)
@@ -271,7 +303,9 @@ def run(request):
         bpy.data.objects.remove(obj, do_unlink=True)
     if request["action"] == "align":
         return {"aligned": str(output / "aligned.glb"), "reference": str(output / "reference.glb"), "message": "请先确认朝向、关节位置和静止姿态，再执行蒙皮。"}
-    weight_report = transfer_weights(meshes, sources, arm, int(config.get("influences", 4)))
+    weight_report = []
+    for item, imported in groups:
+        weight_report.extend(bind_component(imported, sources, arm, config, item))
     warnings = ["表面最近点插值不能保证披风、裙摆、手指等区域正确，请检查测试姿势。"]
     if any(item["unweighted"] for item in weight_report):
         warnings.append("存在未绑定顶点，当前结果需要人工修正，不应直接用于生产。")

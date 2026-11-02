@@ -2,6 +2,7 @@
 // constructed here. Shapes/paths are from the shipped CN Studio P2.0 frontend.
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const GENERATE = '/v2/studio/operation/multiview_to_model'
+const SEGMENT = '/v2/studio/operation/ai_segmentation'
 const PROGRESS = '/v2/studio/progress'
 const DETAIL = '/v2/studio/project/detail/v3/'
 const FAILED = new Set(['failed', 'banned', 'expired', 'cancelled', 'unknown'])
@@ -37,10 +38,10 @@ function detailState(raw, identity) {
 function routeProject(value) {
   try {
     const url = new URL(value)
-    if (url.origin !== 'https://studio.tripo3d.com' || !url.pathname.startsWith('/workspace/generate/')) return null
+    if (url.origin !== 'https://studio.tripo3d.com' || !/^\/workspace\/(generate|segmentation)\//.test(url.pathname)) return null
     const id = url.pathname.split('/').at(-1).slice(-36)
     return UUID.test(id) ? id : null
   } catch { return null }
 }
 
-module.exports = { UUID, GENERATE, PROGRESS, DETAIL, FAILED, apiPath, unpack, acceptance, detailState, routeProject }
+module.exports = { UUID, GENERATE, SEGMENT, PROGRESS, DETAIL, FAILED, apiPath, unpack, acceptance, detailState, routeProject }

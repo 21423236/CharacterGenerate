@@ -33,10 +33,10 @@ async function api(route, options = {}) {
 async function mock(electron, html, success = false, login = false, withoutDetail = false) {
   await electron.evaluate(async ({ session, app }, input) => {
     await session.fromPartition('persist:tripo-studio').setProxy({ mode: 'direct' })
-    globalThis.forgeMock = { success: input.success, generate: 0, details: 0, lastRequest: null }
+    globalThis.forgeMock = { success: input.success, generate: 0, segments: 0, splitHold: false, details: 0, lastRequest: null }
     globalThis.studioShows = []
     app.on('browser-window-created', (_event, window) => window.on('show', () => globalThis.studioShows.push(window.getTitle())))
-    const project='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', operator='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+    const project='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
     const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'content-type', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS' }
     session.fromPartition('persist:tripo-studio').protocol.handle('https', async request => {
       const url = new URL(request.url)
@@ -47,15 +47,21 @@ async function mock(electron, html, success = false, login = false, withoutDetai
       if (url.hostname !== 'api-cn.tripo3d.com') return new Response('', { status: 404 })
       if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers })
       let data
+      const operator=globalThis.forgeMock.segments ? 'cccccccc-cccc-cccc-cccc-cccccccccccc' : 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+      const ready=globalThis.forgeMock.success && !(globalThis.forgeMock.segments && globalThis.forgeMock.splitHold)
       if (url.pathname.endsWith('/operation/multiview_to_model')) {
         globalThis.forgeMock.generate++
         globalThis.forgeMock.lastRequest = await request.json()
         data = { project_id: project, operator_id: operator }
+      } else if (url.pathname.endsWith('/operation/ai_segmentation')) {
+        globalThis.forgeMock.segments++
+        globalThis.forgeMock.segmentRequest=await request.json()
+        data = {project_id:project,operator_id:'cccccccc-cccc-cccc-cccc-cccccccccccc'}
       } else if (url.pathname.endsWith('/progress')) {
-        data = [{ operator_id: operator, status: globalThis.forgeMock.success ? 'success' : 'running', progress: globalThis.forgeMock.success ? 100 : 25 }]
+        data = [{ operator_id: operator, status: ready ? 'success' : 'running', progress: ready ? 100 : 25 }]
       } else if (url.pathname.endsWith('/detail/v3/' + project)) {
         globalThis.forgeMock.details++
-        data = globalThis.forgeMock.success ? { id: project, model_url: 'https://cdn.example.com/model.glb', operator: { operator_id: operator, is_latest_operator: true } } : { id: project, running_operator: { operator_id: operator, status: 'running', progress: 25 } }
+        data = ready ? { id: project, model_url: 'https://cdn.example.com/model.glb', operator: { operator_id: operator, is_latest_operator: true } } : { id: project, running_operator: { operator_id: operator, status: 'running', progress: 25 } }
       } else return new Response('', { status: 404 })
       return new Response(JSON.stringify({ code: 0, data }), { headers })
     })
@@ -175,7 +181,45 @@ async function main() {
     assert.equal(await electron.evaluate(()=>globalThis.forgeMock.details), 0)
     assert.ok(recovered.recoveredAt)
     await electron.close(); electron = undefined
-    console.log('PASS: login/background generation, tolerant request fields, restart without regeneration, GLB preview, selected-model export with no task ID or detail response and no generation POST.')
+    await expect.poll(()=>fetch(BASE+'/api/health',{signal:AbortSignal.timeout(500)}).then(()=>true,()=>false)).toBe(false)
+    electron=await launch();page=await electron.firstWindow()
+    await mock(electron,html,true)
+    await electron.evaluate(()=>{globalThis.forgeMock.splitHold=true})
+    await api(`/projects/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({split_model:true})})
+    await page.evaluate(id=>window.forgeDesktop.automateStudio(id,'start'),id)
+    await expect.poll(async()=> (await runState())?.stage,{timeout:30000}).toBe('split-waiting')
+    let split=await electron.evaluate(()=>globalThis.forgeMock)
+    assert.equal(split.generate,1);assert.equal(split.segments,1)
+    assert.equal(split.segmentRequest.segmentation_granularity,'balanced')
+    await page.evaluate(id=>window.forgeDesktop.automateStudio(id,'pause'),id)
+    await electron.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().find(w=>w.webContents.getURL().startsWith('http://127.0.0.1:')).minimize())
+    await electron.evaluate(()=>{globalThis.forgeMock.splitHold=false})
+    await page.evaluate(id=>window.forgeDesktop.automateStudio(id,'resume'),id)
+    await expect.poll(async()=> (await runState())?.status,{timeout:30000}).toBe('complete')
+    split=await electron.evaluate(()=>globalThis.forgeMock)
+    assert.equal(split.generate,1);assert.equal(split.segments,1)
+    const splitJournal=JSON.parse(await fs.readFile(journal,'utf8'))
+    assert.equal(splitJournal.taskId,'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+    assert.equal(splitJournal.splitTaskId,'cccccccc-cccc-cccc-cccc-cccccccccccc')
+    // A late export popup must remain hidden even if it navigates and requests
+    // focus after the result has been imported into the restored main window.
+    await electron.evaluate(async ({webContents})=>{
+      const remote=webContents.getAllWebContents().find(w=>w.getURL().startsWith('https://studio.tripo3d.com/'))
+      await remote.executeJavaScript("window.exportPopup=window.open('about:blank','late-export');window.exportPopup?.focus()",true)
+    })
+    await expect.poll(()=>electron.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().filter(w=>w.webContents.getURL()==='about:blank').length)).toBe(1)
+    assert.equal(await electron.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().some(w=>w.webContents.getURL()==='about:blank'&&(w.isVisible()||w.isFocusable()))),false)
+    await electron.evaluate(async ({BrowserWindow})=>{
+      const popup=BrowserWindow.getAllWindows().find(w=>w.webContents.getURL()==='about:blank')
+      await popup.loadURL('https://studio.tripo3d.com/export-completed')
+      popup.focus()
+    })
+    await expect.poll(()=>electron.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().filter(w=>w.webContents.getURL().startsWith('https://studio.tripo3d.com/')).every(w=>!w.isVisible()&&!w.isFocusable()))).toBe(true)
+    assert.equal(await electron.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().find(w=>w.webContents.getURL().startsWith('http://127.0.0.1:')).isMinimized()),false)
+    await page.getByRole('button',{name:/角色设计/}).click()
+    await expect(page.getByLabel('角色设计提示词')).toBeEditable()
+    await electron.close();electron=undefined
+    console.log('PASS: background generation, restart without regeneration, selected-model export, second-tier segmentation (balanced), separate task IDs, pause/resume without duplicate generation or segmentation, GLB import.')
     console.log('Artifacts: '+DATA)
   } catch (error) {
     if (id) console.error('Run journal:', await fs.readFile(path.join(DATA, 'studio', id, 'automation.json'), 'utf8').catch(()=>''))

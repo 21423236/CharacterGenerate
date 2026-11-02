@@ -5,7 +5,7 @@ import json
 import re
 from pathlib import Path
 
-from . import processes, providers, store
+from . import processes, providers, store, parts
 from .config import DATA, load_settings, redact
 from .images import suggest_boxes
 from .models import validate_model
@@ -20,7 +20,7 @@ def project_dir(project_id):
 
 
 def output_dir(settings, project_id, job_id):
-    path = Path(settings["output_dir"]).expanduser().resolve() / project_id / job_id
+    path = parts.folder(store.get_project(project_id)) / "任务" / job_id
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -66,7 +66,19 @@ async def execute_job(job, options):
             messages = project.get("messages", []) + [{"role": "user", "content": options["message"]}, {"role": "assistant", "content": reply["reply"]}]
             store.update_project(project_id, {"prompt": reply["prompt"], "messages": messages[-60:]})
             result = {"reply": reply["reply"]}
-        elif kind == "image":
+        elif kind == "parts_plan":
+            suggestions = await providers.suggest_parts(settings, project)
+            store.update_project(project_id, {"part_suggestions": suggestions})
+            result = {"message": "部件清单已识别，请确认需要的部件后添加", "parts": suggestions}
+        elif kind in ("image", "part_image", "part_edit"):
+            project = {**project, "image_stage": kind}
+            if kind == "part_edit":
+                instruction = options.get("message", "").strip()
+                if not instruction or not project.get("parent_id") or not project.get("part_image"):
+                    raise ValueError("修改部件需要已有部件图和修改要求")
+                project["image_edit_instruction"] = instruction
+                store.update_project(project_id, {"part_edit_prompt": instruction})
+                store.update_job(job_id, edit_instruction=instruction, source_asset=project["part_image"])
             inspection = project.get("inspection")
             pose_note = ""
             if inspection:
@@ -84,13 +96,22 @@ async def execute_job(job, options):
                     pose_note = "骨架模板姿态不可用，本次使用默认 A-pose。"
             store.update_job(job_id, message=pose_note + "已提交生图请求，请勿重复点击；此操作可能计费")
             image, prompt = await providers.generate_image(settings, project)
-            path = destination / "turnaround.png"
+            path = destination / ("component-edited.png" if kind == "part_edit" else "component.png" if kind == "part_image" else "turnaround.png")
             image.save(path)
             (destination / "prompt.txt").write_text(prompt, encoding="utf-8")
             asset = store.add_asset(project_id, path, "image")
             boxes = suggest_boxes(image)
-            store.update_project(project_id, {"sheet": asset, "boxes": boxes, "views": {}, "alignment": None, "rig": None, "sheet_revision": job_id})
+            changes = {"sheet": asset, "boxes": boxes, "views": {}, "alignment": None, "rig": None, "sheet_revision": job_id}
+            if kind in ("part_image", "part_edit"):
+                changes = {"part_image": asset, "sheet": None, "views": {}, "model": None, "alignment": None, "rig": None}
+            elif project.get("parent_id"):
+                changes["model"] = None
+            store.update_project(project_id, changes)
             result = {"asset": asset, "assets": {"sheet": asset}, "boxes": boxes, "message": pose_note + "新三视图已生成，请确认设计一致性，并手动校正裁切框和视角标签"}
+            if kind in ("part_image", "part_edit"):
+                result = {"asset": asset, "assets": {"part_image": asset}, "message": "独立部件图已生成，检查后可生成该部件的三视图"}
+                if kind == "part_edit":
+                    result.update(message="部件图已按要求修改，请检查后重新生成该部件三视图", source_asset=project["part_image"], edit_instruction=instruction)
         elif kind == "inspect":
             store.update_job(job_id, message="只读检测骨架、人体权重和静止姿态")
             result = await processes.blender({"action": "inspect", "config": settings["blender"]}, destination)
@@ -125,6 +146,28 @@ async def execute_job(job, options):
                 raise ValueError("无效的 Tripo 任务 ID")
             store.update_job(job_id, remote_id=remote_id, message="仅查询和下载已有任务，不创建新建模任务")
             result = await watch_model(job, settings, remote_id, destination)
+        elif kind == "assemble":
+            components = parts.children(project_id)
+            if not components:
+                raise ValueError("请先添加部件并完成各部件对齐预览")
+            models = []
+            for component in components:
+                alignment = component.get("alignment") or {}
+                if not component.get("model") or alignment.get("model_id") != component["model"]["id"]:
+                    raise ValueError(f"请先完成「{component['title']}」的模型与对齐预览")
+                if alignment.get("config") != settings["blender"] or alignment.get("template_mtime") != processes.template_path(settings["blender"]).stat().st_mtime_ns:
+                    raise ValueError(f"「{component['title']}」模板设置已变化，请重新对齐")
+                if any(j["status"] in ("queued", "running") for j in store.list_jobs(component["id"])):
+                    raise ValueError(f"「{component['title']}」正在处理任务")
+                models.append({"model": store.get_asset(component["model"]["id"], component["id"])["path"],
+                    "title": component["title"], "part_kind": component["part_kind"], "transform": alignment["transform"],
+                    "binding_mode": component.get("binding_mode", "surface"), "binding_bone": component.get("binding_bone", "")})
+            store.update_job(job_id, message="正在组装独立部件并绑定到同一骨架")
+            result = await processes.blender({"action": "assemble", "config": settings["blender"], "models": models, "output": str(destination)}, destination)
+            assets = asset_result(project_id, result, {"blend": "blend", "glb": "model", "fbx": "model"})
+            tests = [{"name": t["name"], "asset": store.add_asset(project_id, t["path"], "model")} for t in result.get("tests", [])]
+            result = {**result, "assets": assets, "tests": tests}
+            store.update_project(project_id, {"rig": result})
         elif kind in ("align", "bind"):
             if not project.get("model"):
                 raise ValueError("请先生成或导入模型")
@@ -138,7 +181,9 @@ async def execute_job(job, options):
                     raise ValueError("模板或蒙皮设置已更改，请重新生成对齐预览")
             store.update_job(job_id, message="正在 Blender 中处理；源模板不会保存或覆盖")
             result = await processes.blender({"action": kind, "config": settings["blender"], "model": model_path,
-                                              "transform": transform, "output": str(destination)}, destination)
+                                              "transform": transform, "part_kind": project.get("part_kind"),
+                                              "binding_mode": project.get("binding_mode", "surface"), "binding_bone": project.get("binding_bone", ""),
+                                              "output": str(destination)}, destination)
             assets = asset_result(project_id, result, {"aligned": "model", "reference": "model", "blend": "blend", "glb": "model", "fbx": "model"})
             if kind == "align":
                 store.update_project(project_id, {"alignment": {"assets": assets, "transform": transform, "model_id": project["model"]["id"],
@@ -153,6 +198,10 @@ async def execute_job(job, options):
             result["message"] = "\n".join(f"{'✓' if item.get('ok') else '!'} {item.get('name')}: {item.get('detail')}" for item in result.get("checks", [])) or "Tripo 检查完成"
         else:
             raise ValueError("未知任务类型")
+        try:
+            result["asset_folder"] = await asyncio.to_thread(parts.organize, project_id)
+        except (OSError, KeyError) as exc:
+            result["folder_warning"] = f"资产已保存，整理文件夹失败：{exc}"
         store.update_job(job_id, "success", progress=100, message=result.get("message", "任务完成"), result=result)
     except Exception as exc:
         current = store.get_job(job_id)

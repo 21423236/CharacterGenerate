@@ -55,23 +55,30 @@ def _project(row):
 
 def list_projects():
     with connection() as conn:
-        return [_project(row) for row in conn.execute("SELECT * FROM projects WHERE deleted=0 ORDER BY updated DESC")]
+        rows = conn.execute("SELECT * FROM projects WHERE deleted=0 ORDER BY updated DESC").fetchall()
+        visible = {row["id"] for row in rows}
+        return [p for row in rows if not (p := _project(row)).get("parent_id") or p["parent_id"] in visible]
 
 
 def get_project(project_id):
     with connection() as conn:
-        return _project(conn.execute("SELECT * FROM projects WHERE id=? AND deleted=0", (project_id,)).fetchone())
+        project = _project(conn.execute("SELECT * FROM projects WHERE id=? AND deleted=0", (project_id,)).fetchone())
+        if project.get("parent_id") and not conn.execute("SELECT 1 FROM projects WHERE id=? AND deleted=0", (project["parent_id"],)).fetchone():
+            raise KeyError("所属角色已删除")
+        return project
 
 
-def create_project(title):
+def create_project(title, extra=None):
     project_id = uuid.uuid4().hex
     data = {"prompt": "", "references": [], "sheet": None, "views": {}, "messages": [], "side": "left"}
+    data.update(extra or {})
     with connection() as conn:
         conn.execute("INSERT INTO projects (id,title,payload,created,updated) VALUES (?,?,?,?,?)", (project_id, title[:100] or "未命名角色", json.dumps(data), now(), now()))
     return get_project(project_id)
 
 
 def update_project(project_id, changes):
+    get_project(project_id)
     with connection() as conn:
         row = conn.execute("SELECT * FROM projects WHERE id=? AND deleted=0", (project_id,)).fetchone()
         project = _project(row)
@@ -81,14 +88,20 @@ def update_project(project_id, changes):
             project.pop(key, None)
         conn.execute("UPDATE projects SET title=?, payload=?, updated=? WHERE id=?",
                      (title, json.dumps(project, ensure_ascii=False), now(), project_id))
+        if project.get("parent_id") and set(changes) & {"model", "alignment", "binding_mode", "binding_bone", "part_image", "sheet"}:
+            conn.execute("UPDATE projects SET payload=json_set(payload,'$.rig',NULL),updated=? WHERE id=?", (now(), project["parent_id"]))
     return get_project(project_id)
 
 
 def delete_project(project_id):
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _project(conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
-        if conn.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('queued','running')", (project_id,)).fetchone():
+        project = _project(conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
+        if project.get("parent_id"):
+            if conn.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('queued','running')", (project["parent_id"],)).fetchone():
+                raise ValueError("所属角色正在处理任务，请等待完成")
+            conn.execute("UPDATE projects SET payload=json_set(payload,'$.rig',NULL),updated=? WHERE id=?", (now(), project["parent_id"]))
+        if conn.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') AND (project_id=? OR project_id IN (SELECT id FROM projects WHERE json_extract(payload,'$.parent_id')=?))", (project_id, project_id)).fetchone():
             raise ValueError("角色正在处理任务，请等待完成后再删除。")
         conn.execute("UPDATE projects SET deleted=1 WHERE id=?", (project_id,))
     return {"id": project_id, "deleted": True}
@@ -104,7 +117,13 @@ def restore_project(project_id):
 def create_job(project_id, kind):
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _project(conn.execute("SELECT * FROM projects WHERE id=? AND deleted=0", (project_id,)).fetchone())
+        project = _project(conn.execute("SELECT * FROM projects WHERE id=? AND deleted=0", (project_id,)).fetchone())
+        if project.get("parent_id"):
+            _project(conn.execute("SELECT * FROM projects WHERE id=? AND deleted=0", (project["parent_id"],)).fetchone())
+            if conn.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('queued','running')", (project["parent_id"],)).fetchone():
+                raise ValueError("所属角色正在处理任务，请等待完成")
+        if kind == "assemble" and conn.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') AND project_id IN (SELECT id FROM projects WHERE json_extract(payload,'$.parent_id')=?)", (project_id,)).fetchone():
+            raise ValueError("部件正在处理任务，请等待完成")
         if conn.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('queued','running')", (project_id,)).fetchone():
             raise ValueError("此项目已有任务正在运行，请等待完成。")
         job_id = uuid.uuid4().hex
@@ -155,3 +174,8 @@ def get_asset(asset_id, project_id=None):
     if row is None or (project_id and row["project_id"] != project_id):
         raise KeyError("文件不存在或不属于当前项目")
     return dict(row)
+
+
+def list_assets(project_id):
+    with connection() as conn:
+        return [dict(row) for row in conn.execute("SELECT * FROM assets WHERE project_id=? ORDER BY created", (project_id,))]

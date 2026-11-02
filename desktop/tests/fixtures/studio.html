@@ -9,6 +9,8 @@ body{font:14px sans-serif}button{padding:10px;margin:3px}.slots{display:flex;wid
 <button aria-haspopup="dialog" aria-expanded="false" id="topology-trigger">拓扑</button>
 <div role="dialog" id="topology-dialog" hidden><p>拓扑</p><button id="close-topology"><i class="i-tripo:close"></i></button><button value="quad" aria-pressed="true">四边面</button><button value="triangle" aria-pressed="false">三角面</button><input type="text" value="5000"><span role="slider" aria-valuenow="5000"></span></div>
 <button id="generate">生成模型 100</button>
+<a href="/workspace/segmentation/female-witch-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">智能拆分</a>
+<div data-workspace-panel id="segmentation-panel" hidden><h2>智能拆分</h2><button id="coarse">粗略 2-5个部件</button><button id="medium">标准 6-15个部件</button><button id="fine">精细 16-30个部件</button><button id="segment">开始拆分 40</button></div>
 <button id="export-trigger" aria-haspopup="dialog" hidden>导出</button>
 <div role="dialog" id="export-dialog" hidden><p>文件名</p><input type="text" value="original"><p>格式</p><button role="combobox" id="format">FBX</button><button id="export">导出</button></div>
 <div role="option" id="glb-option" hidden>GLB</div>
@@ -52,7 +54,11 @@ $('generate').onclick=async()=>{
  const data=await request('/v2/studio/operation/multiview_to_model',body);
  history.pushState({},'','/workspace/generate/'+data.data.project_id);await progress();
 };
-if(location.pathname.endsWith(remoteId))detail();
+let granularity='coarse';
+$('medium').onclick=()=>{granularity='balanced';$('medium').className='ring-2 ring-purple-1 bg-purple-10'};
+$('segment').onclick=async()=>{await request('/v2/studio/operation/ai_segmentation',{project_id:remoteId,segmentation_granularity:granularity});await progress()};
+if(location.pathname.includes('/segmentation/')){$('segmentation-panel').hidden=false;progress()}
+else if(location.pathname.endsWith(remoteId))detail();
 $('export-trigger').onclick=()=>{$('export-dialog').hidden=false};
 $('format').onclick=()=>{$('glb-option').hidden=false};
 $('glb-option').onclick=()=>{$('format').textContent='GLB';$('glb-option').hidden=true};

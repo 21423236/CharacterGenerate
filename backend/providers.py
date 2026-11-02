@@ -87,6 +87,30 @@ async def design_brief(settings: dict, project: dict, message: str) -> dict:
 
 
 def sheet_prompt(project, inspection=None):
+    if project.get("part_kind"):
+        name = project["title"]
+        editing = project.get("image_stage") == "part_edit"
+        common = ((f"Edit the supplied CURRENT isolated component image '{name}'. " if editing else f"Extract ONLY the component '{name}' from the supplied character reference. ") +
+                  "Preserve its exact silhouette, colors, materials and asymmetric details. Reconstruct occluded surfaces consistently. "
+                  "No other clothing, no mannequin, no supporting body, no scenery, no labels. "
+                  "For hair show the complete hairstyle without face or scalp geometry. For paired footwear/gloves show the pair in worn orientation. "
+                  "For a base body show a complete neutral anatomical mannequin wearing plain fitted opaque shorts, without hair, footwear or accessories. "
+                  "White background, diffuse lighting, neutral worn rest shape, no shadows. ")
+        if project["part_kind"] in ("shoes", "gloves"):
+            common += ("This component is ONE COMPLETE PAIR: include BOTH left and right items together as a single asset, "
+                       "even if the reference or component name mentions only one side. Do not generate a single shoe or glove. "
+                       "Keep the two items separate with a small natural gap, in their correct worn positions and matching scale. "
+                       "Each turnaround column shows the SAME complete pair rotated together; maintain their spacing and anatomical left/right identity. "
+                       "In side view natural occlusion is allowed; do not rotate each item independently to expose it. ")
+        if editing:
+            return common + ("Produce ONE isolated front-view component image. Apply the requested changes to the current image, "
+                             "preserving all unmentioned details and composition. The user's requested changes take priority over preservation of original colors, silhouette or materials. "
+                             "Do not return a turnaround sheet.\nUSER EDIT REQUEST:\n" + project["image_edit_instruction"])
+        if project.get("image_stage") == "part_image":
+            return common + "Produce ONE isolated front-view component design image, centered with margins.\n" + project["prompt"]
+        side = project.get("side", "left").upper()
+        return common + (f"Produce exactly THREE equal-width columns: FRONT, {side} SIDE, BACK orthographic views of the SAME component. "
+                         "Identical scale and vertical alignment, empty gutters, no perspective. The isolated component reference is authoritative.\n" + project["prompt"])
     side = "LEFT side (character's anatomical left)" if project.get("side", "left") == "left" else "RIGHT side (character's anatomical right)"
     pose = "A-pose with separated arms, straight legs and flat feet"
     if inspection and inspection.get("pose_hint"):
@@ -108,7 +132,7 @@ async def generate_image(settings, project):
     config = settings["image"]
     check_provider(config)
     prompt = sheet_prompt(project, project.get("inspection"))
-    references = project.get("references", [])[:8]
+    references = ([project["part_image"]] if project.get("part_image") and project.get("image_stage") != "part_image" else project.get("references", []))[:8]
     route = "images/edits" if references else "images/generations"
     payload = {"model": config["model"], "prompt": prompt, "n": 1, "size": config["size"]}
     if config.get("response_format") in ("b64_json", "url"):
@@ -151,3 +175,37 @@ async def generate_image(settings, project):
             return decode_image(raw), prompt
         except (KeyError, IndexError, TypeError) as exc:
             raise ValueError("生图接口未返回标准 data[].b64_json/url 格式；可能已扣费，请先检查供应商记录。") from exc
+
+
+async def suggest_parts(settings, project):
+    import json
+    config = settings["llm"]
+    check_provider(config)
+    if not config.get("vision"):
+        raise ValueError("自动识别部件需要在设置中开启 LLM 视觉能力；也可直接手动添加部件")
+    if not project.get("sheet"):
+        raise ValueError("请先生成角色总图")
+    kinds = ["body", "hair", "top", "coat", "bottom", "shoes", "gloves", "accessory"]
+    schema = {"type": "object", "properties": {"parts": {"type": "array", "minItems": 1, "maxItems": 20,
+        "items": {"type": "object", "properties": {"title": {"type": "string"}, "kind": {"type": "string", "enum": kinds}},
+                  "required": ["title", "kind"], "additionalProperties": False}}}, "required": ["parts"], "additionalProperties": False}
+    payload = {"model": config["model"], "messages": [
+        {"role": "system", "content": "根据角色参考图列出需要独立建模的部件，用中文命名。包含基础身体、发型，以及实际可见的上衣、外套、裤裙、鞋、手套、大型配件。不要凭空添加不存在的服装。鞋子必须作为一双列为一个 shoes 部件，手套必须作为一双列为一个 gloves 部件；成对配件也合为一项，不得分成左脚/右脚或左手/右手项目。只返回 propose_parts 工具结果。"},
+        {"role": "user", "content": [{"type": "text", "text": project.get("prompt", "识别角色部件")},
+                                     {"type": "image_url", "image_url": {"url": image_data_url(project["sheet"]["id"], project["id"])}}]}],
+        "tools": [{"type": "function", "function": {"name": "propose_parts", "description": "建议独立部件清单", "parameters": schema}}],
+        "tool_choice": {"type": "function", "function": {"name": "propose_parts"}}}
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(endpoint(config["base_url"], "chat/completions"), headers={"Authorization": "Bearer " + config["api_key"]}, json=payload)
+        await provider_error(response)
+        try:
+            call = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+            if call["name"] != "propose_parts":
+                raise ValueError()
+            result = json.loads(call["arguments"])["parts"]
+            if not isinstance(result, list) or not 1 <= len(result) <= 20 or any(not isinstance(p, dict) or p.get("kind") not in kinds or not isinstance(p.get("title"), str) or not 1 <= len(p["title"]) <= 100 for p in result):
+                raise ValueError()
+            from .parts import normalize_suggestions
+            return normalize_suggestions(result)
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ValueError("未返回有效部件清单，请手动添加或检查视觉模型设置") from exc

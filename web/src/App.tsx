@@ -4,6 +4,7 @@ import { api, post, DEFAULT_TRANSFORM, jobLabels, type Asset, type Job, type Pro
 import CropEditor from './CropEditor'
 import SettingsDialog from './SettingsDialog'
 import TripoWorkspace from './TripoWorkspace'
+import PartsPanel from './PartsPanel'
 
 const LazyModelViewer = lazy(() => import('./ModelViewer'))
 const ModelViewer = (props: {url?: string; reference?: string}) => <Suspense fallback={<div className="model-viewer"><span className="viewer-label">加载 3D 查看器…</span></div>}><LazyModelViewer {...props}/></Suspense>
@@ -53,7 +54,7 @@ export default function App() {
     Promise.all([api<Settings>('/settings'), api<Project[]>('/projects')]).then(([s, items]) => {
       if (!valid) return
       setSettings(s);setProjects(items)
-      const last = localStorage.getItem('forge-project'); const selected = items.find(p => p.id === last) || items[0]
+      const last = localStorage.getItem('forge-project'); const selected = items.find(p => p.id === last) || items.find(p=>!p.parent_id)
       if(selected) chooseProject(selected)
     }).catch(fail)
     return () => {valid=false}
@@ -78,7 +79,7 @@ export default function App() {
   }, [project?.id,fail])
   useEffect(() => {
     if (!project?.id) return
-    let valid = true; let fetching = false; let previous = ''
+    let valid = true; let fetching = false; let previous: string | undefined
     const id = project.id
     const refresh = async () => {
       if(fetching) return
@@ -89,11 +90,12 @@ export default function App() {
         setJobs(list)
         const signature = list.map(j => `${j.id}:${j.status}`).join(',')
         if(signature !== previous) {
-          previous = signature
           const fresh = await api<Project>(`/projects/${id}`)
-           if(!valid || hiddenProjects.current.has(id) || projectRef.current?.id!==id) return
+            if(!valid || hiddenProjects.current.has(id) || projectRef.current?.id!==id) return
+          previous = signature
           const old = projectRef.current
-           projectRef.current=fresh;setProject(fresh)
+            projectRef.current=fresh;setProject(fresh)
+          if(fresh.parent_id && fresh.sheet && old?.sheet?.id!==fresh.sheet.id) setStep(1)
            if (old?.model?.id !== fresh.model?.id && list[0]?.kind === 'studio_import') setNotice('Tripo 网页模型已回填，可进入骨架与蒙皮。')
           if(old?.prompt !== fresh.prompt) setDraft(fresh.prompt)
           setProjects(items => items.map(p => p.id === id ? fresh : p))
@@ -111,10 +113,11 @@ export default function App() {
     try {
       if(window.forgeDesktop) await window.forgeDesktop.deleteProject(p.id)
       else await api(`/projects/${p.id}`,{method:'DELETE'})
-      setProjects(items=>items.filter(item=>item.id!==p.id))
+      projects.filter(item=>item.parent_id===p.id).forEach(item=>hiddenProjects.current.add(item.id))
+      setProjects(items=>items.filter(item=>item.id!==p.id&&item.parent_id!==p.id))
       setDeletedProjects(items=>[p,...items])
-      if(projectRef.current?.id===p.id) {
-        const next=projects.find(item=>item.id!==p.id && !hiddenProjects.current.has(item.id))
+      if(projectRef.current?.id===p.id||projectRef.current?.parent_id===p.id) {
+        const next=projects.find(item=>item.id===p.parent_id)||projects.find(item=>!item.parent_id&&item.id!==p.id&&!hiddenProjects.current.has(item.id))
         if(next) chooseProject(next)
         else {projectRef.current=undefined;setProject(undefined);setJobs([]);setDraft('');localStorage.removeItem('forge-project')}
         setStep(0);setChat('')
@@ -129,7 +132,9 @@ export default function App() {
     try {
       const restored=await post<Project>(`/projects/${p.id}/restore`)
       hiddenProjects.current.delete(p.id)
-      setProjects(items=>[restored,...items.filter(item=>item.id!==p.id)])
+      const items=await api<Project[]>('/projects')
+      items.forEach(item=>hiddenProjects.current.delete(item.id))
+      setProjects(items)
       setDeletedProjects(items=>items.filter(item=>item.id!==p.id))
       chooseProject(restored);setStep(0)
     } catch(e) {fail(e)} finally {setDeleting(false)}
@@ -165,15 +170,17 @@ export default function App() {
   }
   const start = async (kind: string, extra: Record<string,unknown> = {}) => {
     if(!project || busy) return
+    if(kind==='assemble'&&projects.some(p=>p.parent_id===project.id&&studioRuns[p.id]?.active)){setError('部件仍在 Tripo 生成或下载，请等待完成再组装');return}
     if((kind==='model' || kind==='doctor') && studioMode) { await openStudio(); return }
-    if(kind==='image' && !window.confirm('即将向你配置的生图服务发送设计提示词和参考图，可能产生费用。确认生成？')) return
+    if((kind==='image'||kind==='part_image'||kind==='part_edit') && !window.confirm('即将向你配置的生图服务发送设计提示词和参考图，可能产生费用。确认生成？')) return
     if(kind==='model' && !window.confirm('即将上传三视图并消耗独立的 Tripo API 积分，不使用网页会员额度。确认提交 API 建模？')) return
-    if(kind==='bind' && !window.confirm('已确认角色与绿色模板人体的朝向、比例和关节位置？将转移权重并另存新工程。')) return
+    if((kind==='bind'||kind==='assemble') && !window.confirm('已确认各模型与绿色模板人体的朝向、比例和关节位置？将绑定到模板骨架并另存新工程。')) return
     setPending(true);setError('')
     try {
-      if(kind==='image' || kind==='chat') await saveDraft()
+      if(kind==='image' || kind==='part_image' || kind==='chat') await saveDraft()
       const job=await post<Job>(`/projects/${project.id}/jobs`,{kind,confirmed:true,transform,...extra})
       setJobs(items=>[job,...items]);if(kind==='chat') setChat('');if(kind==='image') setStep(1)
+      if(kind==='assemble')setStep(3)
     }catch(e){fail(e)}finally{setPending(false)}
   }
   const upload = async (file: File | undefined, kind: string) => {
@@ -200,8 +207,8 @@ export default function App() {
     <aside className="sidebar"><a className="brand" href="/" aria-label="角色工坊首页"><div className="brand-symbol"><Fingerprint size={27}/></div><div>角色工坊<span>CHARACTER FORGE</span></div></a>
       <div className="workspace-label">本地工作空间 <span className="live-dot"/></div>
       <button className="new-project" onClick={() => void create()}><Plus size={18}/>创建新角色</button>
-      <div className="nav-caption">角色项目 <span>{projects.length.toString().padStart(2,'0')}</span></div>
-      <nav className="project-list">{projects.map(p=><div className="project-entry" key={p.id}><button className={project?.id===p.id?'active':''} onClick={()=>chooseProject(p)}><span className="project-glyph"><Box size={17}/></span><span>{p.title}<small>{new Date(p.updated).toLocaleDateString('zh-CN')}</small></span>{project?.id===p.id&&<span className="selected-dot"/>}</button><button className="delete-project" aria-label={`删除角色 ${p.title}`} title="删除角色（可撤销）" disabled={deleting||pending||!!studioRuns[p.id]?.active||(project?.id===p.id&&jobs.some(activeStatus))} onClick={()=>void removeProject(p)}><X size={15}/></button></div>)}{!projects.length&&<p className="sidebar-empty">每个好角色，<br/>都从一个想法开始。</p>}</nav>
+      <div className="nav-caption">角色项目 <span>{projects.filter(p=>!p.parent_id).length.toString().padStart(2,'0')}</span></div>
+      <nav className="project-list">{projects.filter(p=>!p.parent_id).map(p=><div className="project-entry" key={p.id}><button className={project?.id===p.id||project?.parent_id===p.id?'active':''} onClick={()=>chooseProject(p)}><span className="project-glyph"><Box size={17}/></span><span>{p.title}<small>{new Date(p.updated).toLocaleDateString('zh-CN')}</small></span>{project?.id===p.id&&<span className="selected-dot"/>}</button><button className="delete-project" aria-label={`删除角色 ${p.title}`} title="删除角色（可撤销）" disabled={deleting||pending||!!studioRuns[p.id]?.active||(project?.id===p.id&&jobs.some(activeStatus))} onClick={()=>void removeProject(p)}><X size={15}/></button></div>)}{!projects.length&&<p className="sidebar-empty">每个好角色，<br/>都从一个想法开始。</p>}</nav>
       <div className="sidebar-bottom"><div className="local-note"><ShieldCheck size={17}/><div>你的模板，始终安全<small>原文件只读 · 结果独立保存</small></div></div><button onClick={()=>setShowSettings(true)} disabled={!settings}><Settings2 size={17}/>模型与工具设置</button><div className="sidebar-version">LOCAL FIRST <span>v0.1.0</span></div></div>
     </aside>
     <main className="main-shell"><header className="topbar"><div className="breadcrumb">工作空间 <span>/</span> <strong>{project?.title || '开始创作'}</strong><ChevronDown size={13}/></div><div className="row"><span className="local-badge"><span className="live-dot"/> 本地运行</span><button className="icon-button" title="设置" onClick={()=>setShowSettings(true)} disabled={!settings}><Settings2 size={19}/></button></div></header>
@@ -212,6 +219,7 @@ export default function App() {
       <div className="page-heading"><div><span className="eyebrow">CHARACTER STUDIO / 角色工作台</span><h1>{project.title}</h1><p>从一张灵感参考，到一个可以动起来的角色。</p></div><div className="project-tag"><span className="live-dot"/>人形角色 · 自定义骨架</div></div>
       <nav className="steps" aria-label="生成阶段">{stepNames.map((name,i)=><button key={name} className={step===i?'active':''} onClick={()=>setStep(i)}><span className="step-number">{(i===0&&project.prompt)||(i===1&&Object.keys(project.views).length)||(i===2&&project.model)||(i===3&&project.rig)?<Check size={14}/>:String(i+1).padStart(2,'0')}</span>{name}{i<3&&<span className="step-line"/>}</button>)}</nav>
       <div className="studio-layout"><div className="work-area">
+        <PartsPanel key={project.id} project={project} projects={projects} busy={busy} open={p=>{chooseProject(p);setStep(p.parent_id&&p.sheet?1:0)}} added={p=>setProjects(items=>[p,...items])} changed={apply} remove={p=>void removeProject(p)} generate={()=>void start('part_image')} revise={message=>void start('part_edit',{message})} turnaround={()=>void start('image')} reviewSheet={()=>setStep(1)} assemble={()=>void start('assemble')} identify={()=>void start('parts_plan')} error={fail}/>
         {currentJob&&<div className="running-job"><LoaderCircle className="spin" size={18}/><div><strong>{jobLabels[currentJob.kind]}</strong><span>{currentJob.message}</span></div><span>{currentJob.progress || 0}%</span><div className="job-progress" style={{width:`${Math.max(currentJob.progress||0,3)}%`}}/></div>}
         {step===0&&<>
           <section className="panel design-panel"><div className="section-title"><div><span className="eyebrow">01 / THE IDEA</span><h2>先给想象一个轮廓。</h2></div><WandSparkles size={24} strokeWidth={1}/></div><p className="muted">描述你心中的角色，也可以让右侧设计助手一起完善细节。</p>
