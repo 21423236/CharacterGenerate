@@ -186,6 +186,36 @@ async function main() {
     await expect.poll(()=>fetch(BASE+'/api/health',{signal:AbortSignal.timeout(500)}).then(()=>true,()=>false)).toBe(false)
     electron=await launch();page=await electron.firstWindow()
     await mock(electron,html,true)
+    // Reproduce Chromium losing polling bodies during segmentation/navigation.
+    // Faults are injected only into this isolated Electron test process.
+    await electron.evaluate(({app,webContents})=>{
+      globalThis.bodyFaults={progress:0,detail:0}
+      const install=contents=>{
+        const debuggerAPI=contents.debugger
+        const original=debuggerAPI.sendCommand.bind(debuggerAPI)
+        const routes=new Map()
+        debuggerAPI.on('message',(_event,method,params)=>{
+          if(method==='Network.requestWillBeSent'&&params.request.method!=='OPTIONS') {
+            const pathname=new URL(params.request.url).pathname
+            if(pathname==='/v2/studio/progress')routes.set(params.requestId,'progress')
+            if(pathname.startsWith('/v2/studio/project/detail/v3/'))routes.set(params.requestId,'detail')
+          }
+        })
+        debuggerAPI.sendCommand=(method,params,sessionId)=>{
+          const kind=routes.get(params?.requestId)
+          if(method==='Network.getResponseBody'&&kind) {
+            routes.delete(params.requestId)
+            if(globalThis.forgeMock.segments&&!globalThis.bodyFaults[kind]) {
+              globalThis.bodyFaults[kind]++
+              return Promise.reject(new Error('No resource with given identifier found'))
+            }
+          }
+          return sessionId ? original(method,params,sessionId) : original(method,params)
+        }
+      }
+      webContents.getAllWebContents().forEach(install)
+      app.on('web-contents-created',(_event,contents)=>install(contents))
+    })
     await electron.evaluate(()=>{globalThis.forgeMock.splitHold=true})
     await api(`/projects/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({split_model:true,model_face_limit:9000})})
     await page.evaluate(id=>window.forgeDesktop.automateStudio(id,'start'),id)
@@ -202,6 +232,7 @@ async function main() {
     split=await electron.evaluate(()=>globalThis.forgeMock)
     assert.equal(split.generate,1);assert.equal(split.segments,1)
     const splitJournal=JSON.parse(await fs.readFile(journal,'utf8'))
+    assert.deepEqual(await electron.evaluate(()=>globalThis.bodyFaults),{progress:1,detail:1})
     assert.equal(splitJournal.config.faces,9000)
     assert.equal(splitJournal.taskId,'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
     assert.equal(splitJournal.splitTaskId,'cccccccc-cccc-cccc-cccc-cccccccccccc')

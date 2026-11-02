@@ -4,6 +4,8 @@ const protocol = require('./studio-protocol.cjs')
 
 class PauseRequired extends Error {}
 
+const missingResponseBody = error => /No resource with given identifier found|No data found for resource with given identifier|Request content was evicted from inspector cache/i.test(error?.message || '')
+
 function delay(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new PauseRequired('自动操作已暂停'))
@@ -113,29 +115,55 @@ class StudioDriver {
     this.attach()
     this.identity = record.taskId ? { taskId: record.taskId, remoteProjectId: record.remoteProjectId } : null
     this.observationError = null; this.result = null; this.acceptSubmission = false; this.expectedDownloadName = null
-    this.events = Promise.resolve(); this.detailEpoch = 0
+    this.events = Promise.resolve(); this.detailEpoch = 0; this.lastProgress = undefined; this.detailBodyMissing = false
     this.submissionRequest = null
+    const tracking = {}
+    this.tracking = tracking
+    const current = () => this.tracking === tracking
     const requests = new Map()
     const operation = record.operation === 'segmentation' ? protocol.SEGMENT : protocol.GENERATE
-    this.listener = (_event, method, params) => {
+    this.listener = (_event, method, params, sessionId) => {
+      if (!current()) return
+      const key = JSON.stringify([sessionId || '', params.requestId])
       if (method === 'Network.requestWillBeSent') {
         const route = protocol.apiPath(params.request.url)
         if (!route || !(route === operation || route === protocol.PROGRESS || route.startsWith(protocol.DETAIL))) return
+        // CORS preflights have no JSON body, even when their URL matches a task.
+        if (params.type === 'Preflight' || !['GET', 'POST'].includes(params.request.method)) return
         // Observe the response even when Studio changes its model version,
         // normalizes values, or represents views/variations differently.
         const generation = route === operation && params.request.method === 'POST' && this.acceptSubmission && !this.identity && !this.submissionRequest
-        if (generation) this.submissionRequest = params.requestId
+        if (generation) this.submissionRequest = key
+        if (route === operation && !generation) return
         if (requests.size > 200) requests.delete(requests.keys().next().value)
-        requests.set(params.requestId, { route, generation, epoch: this.detailEpoch })
+        requests.set(key, { route, generation, epoch: this.detailEpoch })
       }
-      if (method === 'Network.responseReceived' && requests.has(params.requestId)) requests.get(params.requestId).httpStatus = params.response.status
-      if (method === 'Network.loadingFailed') requests.delete(params.requestId)
-      if (method !== 'Network.loadingFinished' || !requests.has(params.requestId)) return
-      const request = requests.get(params.requestId)
-      requests.delete(params.requestId)
+      if (method === 'Network.responseReceived' && requests.has(key)) requests.get(key).httpStatus = params.response.status
+      if (method === 'Network.loadingFailed') requests.delete(key)
+      if (method !== 'Network.loadingFinished' || !requests.has(key)) return
+      const request = requests.get(key)
+      requests.delete(key)
+      if (request.httpStatus < 200 || request.httpStatus >= 300 || !request.httpStatus || request.httpStatus === 204 || request.httpStatus === 205) return
+      // Capture the response immediately, before disk writes / other event
+      // handlers delay us or navigation discards Chromium's response buffer.
+      const capture = sessionId
+        ? this.contents.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId }, sessionId)
+        : this.contents.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId })
+      const body = capture.then(response => ({ response }), error => ({ error }))
       this.events = this.events.then(async () => {
-        if (request.httpStatus < 200 || request.httpStatus >= 300 || !request.httpStatus) return
-        const response = await this.contents.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId })
+        const captured = await body
+        // A late response from generation must not poison segmentation tracking.
+        if (!current()) return
+        if (request.route.startsWith(protocol.DETAIL) && request.epoch !== this.detailEpoch) return
+        if (captured.error) {
+          if (!missingResponseBody(captured.error)) throw captured.error
+          if (request.generation) throw new PauseRequired(`${record.operation === 'segmentation' ? '二次拆分' : '生成'}请求已发出，但网页提交回执无法读取。请在 Tripo 资产中选中本次结果，再点击“接续当前网页模型”；程序不会重复提交`)
+          // Polling responses can disappear during navigation. Wait for the
+          // next poll; refresh only the known project if its detail was lost.
+          if (this.identity && request.route === protocol.DETAIL + this.identity.remoteProjectId) this.detailBodyMissing = true
+          return
+        }
+        const { response } = captured
         const raw = JSON.parse(response.base64Encoded ? Buffer.from(response.body, 'base64').toString('utf8') : response.body)
         if (request.generation) {
           const identity = protocol.acceptance(raw)
@@ -156,16 +184,18 @@ class StudioDriver {
         }
         if (request.route === protocol.DETAIL + this.identity.remoteProjectId && request.epoch === this.detailEpoch) {
           const result = protocol.detailState(raw, this.identity)
+          if (result) this.detailBodyMissing = false
           if (result?.conflict) throw new Error('该网页项目已切换到其他生成版本或有新的操作，已暂停自动导出')
           if (result?.ready) this.result = result
         }
-      }).catch(error => { this.observationError = new PauseRequired(`无法继续确认网页任务：${error.message}`) })
+      }).catch(error => { if (current()) this.observationError = error instanceof PauseRequired ? error : new PauseRequired(`无法继续确认网页任务：${error.message}`) })
     }
     this.contents.debugger.on('message', this.listener)
     await this.contents.debugger.sendCommand('Network.enable', { maxResourceBufferSize: 8000000, maxTotalBufferSize: 16000000 })
   }
 
   stopTracking() {
+    this.tracking = null
     if (this.listener && !this.contents.isDestroyed()) this.contents.debugger.removeListener('message', this.listener)
     this.listener = null
   }
@@ -258,17 +288,24 @@ class StudioDriver {
     if (!protocol.UUID.test(record.remoteProjectId) || !protocol.UUID.test(record.taskId)) throw new Error('缺少完整的网页项目与生成版本 ID')
     if (signal.aborted) throw new PauseRequired('已暂停任务跟踪')
     this.result = null
+    this.detailBodyMissing = false
     this.detailEpoch++
     await this.loadProject(record.remoteProjectId, signal)
     await this.ready(signal)
   }
 
-  async waitForResult(_record, signal) {
+  async waitForResult(record, signal) {
     const deadline = Date.now() + 30 * 60 * 1000
+    let detailRefreshes = 0
     while (Date.now() < deadline) {
       if (signal.aborted) throw new PauseRequired('已暂停跟踪；云端任务仍会继续')
       if (this.observationError) throw this.observationError
       if (this.result?.ready || this.result?.failed) return this.result
+      if (this.detailBodyMissing) {
+        if (detailRefreshes++ >= 2) throw new PauseRequired('网页任务详情暂时无法读取。可点击继续任务恢复跟踪，或选中本次结果后点击“接续当前网页模型”；不会重复生成或拆分')
+        await this.restore(record, signal)
+        continue
+      }
       const snapshot = await this.invoke('snapshot')
       if (snapshot.loginRequired) await this.login(signal)
       await delay(1200, signal)

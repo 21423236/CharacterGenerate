@@ -19,6 +19,131 @@ const directory = async () => {
 }
 const options = { config: { topology: 'triangle', faces: 15000 }, files: { front: 'front.png', left: 'left.png', back: 'back.png' }, assetIds: {}, expectedModelId: '' }
 
+function responseHarness(readBody) {
+  const debuggerAPI = new EventEmitter()
+  debuggerAPI.isAttached = () => true
+  debuggerAPI.sendCommand = async (method, params, sessionId) => method === 'Network.getResponseBody' ? readBody(params.requestId, sessionId) : {}
+  const driver = new StudioDriver({ debugger: debuggerAPI, isDestroyed: () => false })
+  const emit = (id, route, { method = 'POST', status = 200, type = 'Fetch', sessionId } = {}) => {
+    debuggerAPI.emit('message', {}, 'Network.requestWillBeSent', { requestId: id, type, request: { url: 'https://api-cn.tripo3d.com' + route, method } }, sessionId)
+    debuggerAPI.emit('message', {}, 'Network.responseReceived', { requestId: id, response: { status } }, sessionId)
+    debuggerAPI.emit('message', {}, 'Network.loadingFinished', { requestId: id }, sessionId)
+  }
+  return { driver, emit }
+}
+
+test('segmentation ignores preflights and bodyless responses and survives a lost progress body', async () => {
+  const reads = []
+  const { driver, emit } = responseHarness(async (id, sessionId) => {
+    reads.push([id, sessionId])
+    if (id === 'lost-poll') throw new Error('No resource with given identifier found')
+    return { body: JSON.stringify({data: id === 'submit' ? {project_id:project,operator_id:other} : [{operator_id:other,status:'running',progress:60}]}) }
+  })
+  const events = []
+  await driver.startTracking({...options, operation:'segmentation'}, event => events.push(event))
+  driver.acceptSubmission = true
+  const route = '/v2/studio/operation/ai_segmentation'
+  emit('preflight', route, {method:'OPTIONS', type:'Preflight', status:204})
+  emit('empty', '/v2/studio/progress', {status:204})
+  emit('submit', route, {sessionId:'renderer-session'})
+  emit('lost-poll', '/v2/studio/progress')
+  emit('next-poll', '/v2/studio/progress')
+  await driver.events
+  assert.deepEqual(reads.map(([id])=>id), ['submit','lost-poll','next-poll'])
+  assert.equal(reads[0][1], 'renderer-session')
+  assert.equal(driver.observationError, null)
+  assert.deepEqual(driver.identity, {taskId:other,remoteProjectId:project})
+  assert.equal(events.at(-1).progress, 60)
+  driver.stopTracking()
+})
+
+test('response bodies are captured before queued journal writes finish', async () => {
+  const reads = []
+  let releaseWrite, startedWrite
+  const writing = new Promise(resolve => { startedWrite = resolve })
+  const blocked = new Promise(resolve => { releaseWrite = resolve })
+  const { driver, emit } = responseHarness(async id => {
+    reads.push(id)
+    return {body:JSON.stringify({data:{project_id:project,operator_id:operator}})}
+  })
+  await driver.startTracking(options, async () => { startedWrite(); await blocked })
+  driver.acceptSubmission = true
+  emit('submit', '/v2/studio/operation/multiview_to_model')
+  await writing
+  emit('poll', '/v2/studio/progress')
+  assert.deepEqual(reads, ['submit','poll'])
+  releaseWrite()
+  await driver.events
+  assert.equal(driver.observationError, null)
+  driver.stopTracking()
+})
+
+test('late responses and errors from generation cannot mutate segmentation tracking', async () => {
+  for (const fail of [false, true]) {
+    let finish
+    const pending = new Promise((resolve, reject) => { finish = () => fail ? reject(new Error('No resource with given identifier found')) : resolve({body:JSON.stringify({data:{project_id:project,operator_id:operator}})}) })
+    const { driver, emit } = responseHarness(() => pending)
+    const events = []
+    await driver.startTracking(options, event => events.push(event))
+    driver.acceptSubmission = true
+    emit('old-submit', '/v2/studio/operation/multiview_to_model')
+    const oldEvents = driver.events
+    await driver.startTracking({...options,operation:'segmentation',taskId:other,remoteProjectId:project}, event => events.push(event))
+    finish()
+    await oldEvents
+    assert.deepEqual(driver.identity, {taskId:other,remoteProjectId:project})
+    assert.equal(driver.observationError, null)
+    assert.deepEqual(events, [])
+    driver.stopTracking()
+  }
+})
+
+test('a lost known-project detail can refresh read-only tracking, but a conflicting version still pauses', async () => {
+  const { driver, emit } = responseHarness(async id => {
+    if (id === 'missing') throw new Error('Request content was evicted from inspector cache')
+    return {body:JSON.stringify({data:{id:project,model_url:'https://example.com/model.glb',operator:{operator_id:other,is_latest_operator:true}}})}
+  })
+  const record = {...options,operation:'segmentation',taskId:other,remoteProjectId:project}
+  await driver.startTracking(record, () => {})
+  emit('missing', '/v2/studio/project/detail/v3/' + project)
+  await driver.events
+  assert.equal(driver.observationError, null)
+  let refreshes = 0
+  driver.restore = async received => {
+    assert.equal(received.taskId, other)
+    refreshes++
+    emit('fresh', '/v2/studio/project/detail/v3/' + project)
+    await driver.events
+  }
+  assert.equal((await driver.waitForResult(record, new AbortController().signal)).ready, true)
+  assert.equal(refreshes, 1)
+  await driver.startTracking({...record,taskId:operator}, () => {})
+  emit('conflict', '/v2/studio/project/detail/v3/' + project)
+  await driver.events
+  assert.match(driver.observationError.message, /其他生成版本/)
+  driver.stopTracking()
+})
+
+test('an unreadable segmentation receipt preserves the submitted checkpoint and never resubmits', async () => {
+  const dir = await directory()
+  let clicks = 0
+  const { driver, emit } = responseHarness(async () => { throw new Error('No resource with given identifier found') })
+  driver.prepareSegmentation = async () => {}
+  driver.submitSegmentation = async () => { clicks++; driver.acceptSubmission = true; emit('submit', '/v2/studio/operation/ai_segmentation'); await driver.events }
+  driver.waitForTask = async () => { throw driver.observationError }
+  try {
+    const run = new StudioRun({directory:dir,projectId:'a'.repeat(32),driver})
+    await run.save({version:1,projectId:'a'.repeat(32),config:{...options.config,splitModel:true},submitted:true,remoteProjectId:project,recoveryMode:'selected-model',status:'paused'})
+    await run.resume(); await run.work
+    assert.equal(run.record.splitSubmitted, true)
+    assert.match(run.record.message, /二次拆分请求已发出.*接续当前网页模型/)
+    const restored = new StudioRun({directory:dir,projectId:'a'.repeat(32),driver})
+    await restored.load(); await restored.resume(); await restored.work
+    assert.equal(clicks, 1)
+    assert.match(restored.record.message, /二次拆分已发出/)
+  } finally { await fs.rm(dir, {recursive:true,force:true}) }
+})
+
 test('accepted submissions are tracked despite changed, normalized or absent request fields', async () => {
   for (const body of [undefined, '{invalid JSON', JSON.stringify({ model_version: 'future-model', face_limit: '14999', image: [], variations: [] })]) {
     const debuggerAPI = new EventEmitter()
