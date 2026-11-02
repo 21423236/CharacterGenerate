@@ -1,0 +1,63 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body{font:14px sans-serif}button{padding:10px;margin:3px}.slots{display:flex;width:800px}.slot{width:200px;height:200px}.slot input,.slot img{width:180px;height:160px} [role=dialog]{border:1px solid;padding:20px;background:white} [hidden]{display:none!important}
+</style></head><body>
+<button id="login" hidden>注册/登录</button><button id="smart" class="c-black">智能网格</button>
+<div id="test-login" hidden><button id="finish-login">确认测试登录</button></div>
+<button id="multi"><i class="i-tripo:multi-view"></i>多视图</button>
+<div class="slots"></div>
+<button value="1" aria-pressed="false" id="quantity">1</button><button role="combobox">P2.0</button>
+<button aria-haspopup="dialog" aria-expanded="false" id="topology-trigger">拓扑</button>
+<div role="dialog" id="topology-dialog" hidden><p>拓扑</p><button id="close-topology"><i class="i-tripo:close"></i></button><button value="quad" aria-pressed="true">四边面</button><button value="triangle" aria-pressed="false">三角面</button><input type="text" value="5000"><span role="slider" aria-valuenow="5000"></span></div>
+<button id="generate">生成模型 100</button>
+<button id="export-trigger" aria-haspopup="dialog" hidden>导出</button>
+<div role="dialog" id="export-dialog" hidden><p>文件名</p><input type="text" value="original"><p>格式</p><button role="combobox" id="format">FBX</button><button id="export">导出</button></div>
+<div role="option" id="glb-option" hidden>GLB</div>
+<script>
+const remoteId='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', operatorId='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+const API='https://api-cn.tripo3d.com';
+const $=id=>document.getElementById(id);
+$('login').hidden=!__LOGIN_REQUIRED__ || sessionStorage.getItem('signed-in')==='yes';
+$('login').onclick=()=>{$('test-login').hidden=false};
+$('finish-login').onclick=()=>{sessionStorage.setItem('signed-in','yes');$('login').hidden=true;$('test-login').hidden=true};
+const labels=['front','left','right','back'];
+const uploads={};
+window.uploads=uploads;
+async function request(route,body){return (await fetch(API+route,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{})).json()}
+for(const label of labels){
+ const slot=document.createElement('div'); slot.className='w-1/2 aspect-square box-border slot';
+ slot.innerHTML='<div><i class="i-tripo:'+label+'-view"></i><span>'+label+'</span><input type="file" accept="image/png"></div>';
+ slot.querySelector('input').onchange=async event=>{
+  const file=event.target.files[0];uploads[label]=file.name;
+  slot.innerHTML='<div class="loading-container">上传中…</div>';
+  const image=new Image();image.src=URL.createObjectURL(file);
+  await image.decode(); slot.replaceChildren(image);
+ };
+ document.querySelector('.slots').append(slot);
+}
+$('quantity').onclick=()=>{$('quantity').setAttribute('aria-pressed','true')};
+let committedFaces=5000,draftFaces='5000';
+$('topology-trigger').onclick=()=>{$('topology-dialog').hidden=false;$('topology-trigger').setAttribute('aria-expanded','true');$('topology-dialog').querySelector('input').value=String(committedFaces)};
+$('close-topology').onclick=()=>{$('topology-dialog').hidden=true;$('topology-trigger').setAttribute('aria-expanded','false')};
+for(const button of $('topology-dialog').querySelectorAll('button[value]'))button.onclick=()=>{for(const b of $('topology-dialog').querySelectorAll('button[value]'))b.setAttribute('aria-pressed',String(b===button))};
+const faceInput=$('topology-dialog').querySelector('input');
+faceInput.oninput=event=>{const value=event.target.value;queueMicrotask(()=>{draftFaces=value})};
+faceInput.onblur=()=>{committedFaces=Number(draftFaces);$('topology-dialog').querySelector('[role=slider]').setAttribute('aria-valuenow',String(committedFaces))};
+// Exercise the background-view case where the native blur does not fire.
+faceInput.blur=()=>{};
+async function detail(){if(!__NO_DETAIL__)await request('/v2/studio/project/detail/v3/'+remoteId);$('export-trigger').hidden=false}
+async function progress(){const data=await request('/v2/studio/progress',{ids:[operatorId]});if(data.data[0].status==='success')await detail();else setTimeout(progress,250)}
+$('generate').onclick=async()=>{
+ const file=label=>uploads[label]?{bucket:'images',key:label}:null;
+ const body={model_version:'Nexus-v2.1-future',face_limit:committedFaces,quad:$('topology-dialog').querySelector('button[value=quad]').getAttribute('aria-pressed')==='true',variations:[],image:[file('front'),file('left'),file('back'),file('right')]};
+ const data=await request('/v2/studio/operation/multiview_to_model',body);
+ history.pushState({},'','/workspace/generate/'+data.data.project_id);await progress();
+};
+if(location.pathname.endsWith(remoteId))detail();
+$('export-trigger').onclick=()=>{$('export-dialog').hidden=false};
+$('format').onclick=()=>{$('glb-option').hidden=false};
+$('glb-option').onclick=()=>{$('format').textContent='GLB';$('glb-option').hidden=true};
+$('export').onclick=()=>{
+ const a=document.createElement('a');a.download=$('export-dialog').querySelector('input').value+'.zip';
+ a.href=URL.createObjectURL(new Blob([Uint8Array.from(atob('__MODEL_ZIP__'),c=>c.charCodeAt(0))]));a.click();
+};
+</script></body></html>

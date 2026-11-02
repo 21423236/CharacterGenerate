@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'">
+  <title>Tripo 网页会员工作台</title>
+  <link rel="stylesheet" href="toolbar.css">
+</head>
+<body>
+  <header>
+    <div id="login-heading" hidden><strong>登录 Tripo</strong><p>完成登录后窗口会自动收起，模型将在角色工坊中显示。</p><button data-action="pause">暂不登录，暂停任务</button></div>
+    <div class="heading"><strong id="project">Tripo 网页会员工作台</strong><span id="parameters">智能网格 · 默认三角面 / 15,000 面 · 网页会员额度</span></div>
+    <div class="automation-actions">
+      <button data-action="start" disabled>一键上传并生成</button>
+      <button data-action="resume" disabled>继续任务</button>
+      <button data-action="recover" hidden disabled>接续当前网页模型</button>
+      <button data-action="pause" disabled>暂停自动操作</button>
+      <button data-action="cancel" disabled>取消未提交任务</button>
+      <span id="input-status">正在检查三视图…</span>
+    </div>
+    <div class="actions">
+      <button data-action="views">打开三视图文件夹</button>
+      <button data-action="copy">复制图片目录</button>
+      <button data-action="downloads">下载文件夹</button>
+      <button data-action="import">导入已下载 GLB</button>
+      <button data-action="reload">刷新网页</button>
+      <button data-action="external">系统浏览器打开</button>
+      <button data-action="return">返回角色工坊</button>
+    </div>
+    <p id="status" role="status">准备工作台…</p>
+  </header>
+  <script src="toolbar.js"></script>
+</body>
+</html>
