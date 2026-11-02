@@ -7,6 +7,7 @@ export type Project = {
   parent_id?: string; part_kind?: string; part_image?: Asset; split_model?: boolean; binding_mode?: 'surface' | 'rigid'; binding_bone?: string;
   part_suggestions?: {title: string; kind: string}[];
   part_edit_prompt?: string;
+  model_face_limit?: number | null;
   id: string; title: string; prompt: string; side: 'left' | 'right'; updated: string;
   references: Asset[]; sheet?: Asset; boxes?: number[][]; views: Record<string, Asset>;
   messages: { role: string; content: string }[]; inspection?: Inspection;

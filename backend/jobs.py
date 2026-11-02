@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from . import processes, providers, store, parts
-from .config import DATA, load_settings, redact
+from .config import DATA, load_settings, redact, resolve_model_faces
 from .images import suggest_boxes
 from .models import validate_model
 
@@ -127,7 +127,7 @@ async def execute_job(job, options):
                 raise ValueError("请先拆分并确认三视图")
             paths = [store.get_asset(views[label]["id"], project_id)["path"] for label in ("front", side, "back")]
             config = settings["tripo"]
-            face_limit = int(config["face_limit"])
+            face_limit = resolve_model_faces(project, config)
             model = config["model"]
             if face_limit <= 20000 and model == "tripo-v3.1":
                 model = "tripo-p1"

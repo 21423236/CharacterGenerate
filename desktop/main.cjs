@@ -366,7 +366,7 @@ async function automate(id, action) {
   await prepareViews(project, views)
   ctx.views = views
   ctx.modelID = project.model?.id || ''
-  await ctx.automation.start({ config: { topology: project.split_model ? 'triangle' : settings.tripo.studio_topology || 'triangle', faces: settings.tripo.studio_face_limit ?? 15000, splitModel: !!project.split_model },
+  await ctx.automation.start({ config: { topology: project.split_model ? 'triangle' : settings.tripo.studio_topology || 'triangle', faces: project.model_face_limit ?? settings.tripo.studio_face_limit ?? 15000, splitModel: !!project.split_model },
     files: Object.fromEntries(labels.map(label => [label, path.join(views, `${label}.png`)])),
     assetIds: Object.fromEntries(labels.map(label => [label, project.views[label].id])), expectedModelId: ctx.modelID })
 }

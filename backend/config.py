@@ -26,6 +26,21 @@ DEFAULTS = {
 }
 
 
+def resolve_model_faces(project: dict, tripo: dict) -> int:
+    studio = tripo.get("mode", "studio") != "api"
+    faces = project.get("model_face_limit")
+    if faces is None:
+        faces = tripo.get("studio_face_limit", 15000) if studio else tripo.get("face_limit", 50000)
+    if studio:
+        quad = tripo.get("studio_topology") == "quad" and not project.get("split_model")
+        maximum = 25000 if quad else 50000
+    else:
+        maximum = {"tripo-p1": 20000, "tripo-p2": 50000}.get(tripo.get("model"), 150000)
+    if type(faces) is not int or not 500 <= faces <= maximum:
+        raise ValueError(f"当前建模模式的面数必须为 500–{maximum} 的整数，请调整部件面数或使用全局默认")
+    return faces
+
+
 class Blob(ctypes.Structure):
     _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 

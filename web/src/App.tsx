@@ -6,6 +6,7 @@ import SettingsDialog from './SettingsDialog'
 import TripoWorkspace from './TripoWorkspace'
 import PartsPanel from './PartsPanel'
 import PartEditor from './PartEditor'
+import ModelFaceBudget from './ModelFaceBudget'
 import ZoomImage from './ZoomImage'
 import { characterSteps, partSteps, partStatus, resumeStep, viewsReady, type Step } from './workflow'
 
@@ -32,6 +33,7 @@ export default function App() {
   const [draft, setDraft] = useState('')
   const [chat, setChat] = useState('')
   const [pending, setPending] = useState(false)
+  const [modelOptionsDirty, setModelOptionsDirty] = useState(false)
   const [studioRuns, setStudioRuns] = useState<Record<string, StudioRun>>({})
   const shownRuns = useRef(new Set<string>())
   const [promptRequest, setPromptRequest] = useState<{ message: string; value: string; resolve: (value: string | null) => void }>()
@@ -169,6 +171,7 @@ export default function App() {
   }
   const automateStudio = async (action: 'start'|'resume'|'pause'|'cancel') => {
     if(!project || !window.forgeDesktop?.automateStudio || pending) return
+    if(action==='start' && modelOptionsDirty) return
     setPending(true);setError('');setStep('model')
     try { await window.forgeDesktop.automateStudio(project.id,action) }
     catch(e) { fail(e) }
@@ -176,6 +179,7 @@ export default function App() {
   }
   const start = async (kind: string, extra: Record<string,unknown> = {}) => {
     if(!project || busy) return
+    if(kind==='model' && modelOptionsDirty) return
     if(kind==='assemble'&&projects.some(p=>p.parent_id===project.id&&studioRuns[p.id]?.active)){setError('部件仍在 Tripo 生成或下载，请等待完成再组装');return}
     if((kind==='model' || kind==='doctor') && studioMode) { await openStudio(); return }
     if((kind==='image'||kind==='part_image'||kind==='part_edit') && !window.confirm('即将向你配置的生图服务发送设计提示词和参考图，可能产生费用。确认生成？')) return
@@ -265,9 +269,10 @@ export default function App() {
           <div className="panel-actions"><button className="button ghost" onClick={()=>setStep(project.parent_id?'part-sheet':'image')}>返回查看三视图</button><button className="button primary" disabled={busy||!viewsReady(project)} onClick={()=>setStep('model')}>裁切已确认，进入建模<ArrowRight size={16}/></button></div></section>
         </>}
         {step==='model'&&<section className="panel model-panel"><div className="section-title"><div><span className="eyebrow">MODEL / RECONSTRUCTION</span><h2>{project.parent_id ? `生成部件模型 · ${project.title}` : '整角色模型工具'}</h2></div><button className="button secondary" disabled={busy} onClick={()=>modelInput.current?.click()}><Upload size={15}/>导入 GLB</button></div>
+          {project.parent_id && <ModelFaceBudget key={project.id} project={project} config={settings?.tripo} busy={busy} changed={apply} onDirty={setModelOptionsDirty} error={fail}/>}
           {partEditor}
-          <TripoWorkspace project={project} studio={studioMode} busy={busy} open={()=>void openStudio()} prepare={()=>setStep('crop')} settings={()=>setShowSettings(true)} config={settings?.tripo} run={studioRun} automate={action=>void automateStudio(action)}/>
-          <ModelViewer url={project.model?.name.endsWith('.glb')?project.model.url:undefined}/>{project.model_preview&&<details className="preview-details"><summary>查看 Tripo 服务端预览图</summary><img src={project.model_preview.url} alt="Tripo 预览"/></details>}<div className="panel-actions"><div className="row wrap">{project.model&&download(project.model,'下载原始模型')}{!studioMode&&<button className="button primary" disabled={busy||!viewsReady(project)} onClick={()=>void start('model')}><RefreshCw size={14}/>{project.model?'API 重新建模（计费）':'API 从三视图生成模型'}</button>}</div>{project.parent_id&&project.model ? <button className="button primary" onClick={()=>{if(character)chooseProject(character,'models')}}>完成，返回部件总览<ArrowRight size={16}/></button> : null}</div><div className="workflow-followup"><button className="button secondary" disabled={!project.model||busy} onClick={()=>setStep('rig')}>{project.parent_id?'后续处理：对齐与绑定':'适配我的骨架'}<ArrowRight size={16}/></button></div></section>}
+          <TripoWorkspace project={project} studio={studioMode} busy={busy||modelOptionsDirty} open={()=>void openStudio()} prepare={()=>setStep('crop')} settings={()=>setShowSettings(true)} config={settings?.tripo} run={studioRun} automate={action=>void automateStudio(action)}/>
+          <ModelViewer url={project.model?.name.endsWith('.glb')?project.model.url:undefined}/>{project.model_preview&&<details className="preview-details"><summary>查看 Tripo 服务端预览图</summary><img src={project.model_preview.url} alt="Tripo 预览"/></details>}<div className="panel-actions"><div className="row wrap">{project.model&&download(project.model,'下载原始模型')}{!studioMode&&<button className="button primary" disabled={busy||modelOptionsDirty||!viewsReady(project)} onClick={()=>void start('model')}><RefreshCw size={14}/>{project.model?'API 重新建模（计费）':'API 从三视图生成模型'}</button>}</div>{project.parent_id&&project.model ? <button className="button primary" onClick={()=>{if(character)chooseProject(character,'models')}}>完成，返回部件总览<ArrowRight size={16}/></button> : null}</div><div className="workflow-followup"><button className="button secondary" disabled={!project.model||busy} onClick={()=>setStep('rig')}>{project.parent_id?'后续处理：对齐与绑定':'适配我的骨架'}<ArrowRight size={16}/></button></div></section>}
         {step==='rig'&&<>
           <section className="panel"><div className="section-title"><div><span className="eyebrow">04 / MADE TO MOVE</span><h2>让角色，用你的骨架动起来。</h2></div><button className="button secondary" disabled={busy} onClick={()=>void start('inspect')}><ScanLine size={15}/>检测模板</button></div><div className="template-path"><Fingerprint size={20}/><div><strong>{settings?.blender.armature || '_COM'}</strong><span>{settings?.blender.template}</span></div><button className="icon-button" title="修改模板路径" onClick={()=>setShowSettings(true)}><Settings2 size={16}/></button></div>
           {project.inspection&&<><div className="inspection-stats"><div><strong>{project.inspection.bone_count}</strong><span>骨骼</span></div><div><strong>{project.inspection.sources.reduce((sum,s)=>sum+s.vertices,0).toLocaleString()}</strong><span>权重源顶点</span></div><div><strong>{project.inspection.height.toFixed(2)} m</strong><span>模板高度</span></div><div><strong>{project.inspection.actions.length}</strong><span>保留动作数据</span></div></div><p className="field-note">静止姿态：{project.inspection.pose_hint}</p></>}

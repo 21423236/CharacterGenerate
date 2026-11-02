@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import jobs, processes, store, parts
-from .config import ROOT, PORT, load_settings, redact, save_settings
+from .config import ROOT, PORT, load_settings, redact, save_settings, resolve_model_faces
 from .images import MAX_IMAGE_BYTES, decode_image, split_views, suggest_boxes
 from .providers import endpoint
 from .models import validate_glb
@@ -125,6 +125,7 @@ class ProjectUpdate(BaseModel):
     binding_mode: Literal["surface", "rigid"] | None = None
     binding_bone: str | None = Field(default=None, max_length=200)
     part_edit_prompt: str | None = Field(default=None, max_length=8000)
+    model_face_limit: int | None = Field(default=None, ge=500, le=150000, strict=True)
 
 
 class Transform(BaseModel):
@@ -238,7 +239,13 @@ def ensure_idle(project_id):
 @app.patch("/api/projects/{project_id}")
 def project_update(project_id: str, body: ProjectUpdate):
     ensure_idle(project_id)
-    return store.update_project(project_id, body.model_dump(exclude_none=True))
+    changes = body.model_dump(exclude_none=True)
+    if "model_face_limit" in body.model_fields_set:
+        changes["model_face_limit"] = body.model_face_limit
+    if "model_face_limit" in changes or "split_model" in changes:
+        candidate = {**store.get_project(project_id), **changes}
+        resolve_model_faces(candidate, load_settings()["tripo"])
+    return store.update_project(project_id, changes)
 
 
 @app.get("/api/projects/{project_id}/jobs")
