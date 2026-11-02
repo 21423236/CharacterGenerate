@@ -97,7 +97,7 @@ export default function ModelViewer({ url, reference }: { url?: string; referenc
     }
   }, [url, reference])
   return <div className="model-viewer" ref={mount}>
-    {!url && <div className="viewer-empty"><Rotate3d size={42} strokeWidth={1} /><h3>你的角色，即将拥有第三个维度</h3><p>确认三视图后生成模型，或导入已有 GLB</p></div>}
+    {!url && <div className="viewer-empty"><Rotate3d size={42} strokeWidth={1} /><h3>模型将在这里预览</h3><p>确认三视图裁切后生成模型，或导入已有 GLB</p></div>}
     {loading && <span className="viewer-label">正在加载模型…</span>}
     {error && <span className="viewer-error">{error}</span>}
     {url && !error && <span className="viewer-label">拖动旋转 · 滚轮缩放{reference ? ' · 绿色线框为模板人体' : ''}</span>}
